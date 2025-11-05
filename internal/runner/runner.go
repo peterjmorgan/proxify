@@ -60,6 +60,8 @@ func NewRunner(options *Options) (*Runner, error) {
 		Allow:                       options.Allow,
 		Deny:                        options.Deny,
 		PassThrough:                 options.PassThrough,
+		TLSFingerprint:              options.TLSFingerprint,
+		TLSProfile:                  options.TLSProfile,
 	})
 	if err != nil {
 		return nil, err
@@ -113,6 +115,10 @@ func (r *Runner) Run() error {
 		gologger.Info().Msgf("Using upstream HTTP proxies: %s\n", r.options.UpstreamHTTPProxies)
 	} else if len(r.options.UpstreamSocks5Proxies) > 0 {
 		gologger.Info().Msgf("Using upstream SOCKS5 proxies: %s\n", r.options.UpstreamSocks5Proxies)
+	}
+
+	if r.options.TLSFingerprint {
+		gologger.Info().Msgf("TLS Fingerprinting enabled with profile: %s\n", r.options.TLSProfile)
 	}
 
 	if r.options.DNSMapping != "" {

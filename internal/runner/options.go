@@ -4,6 +4,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/projectdiscovery/goflags"
@@ -13,6 +14,7 @@ import (
 	"github.com/projectdiscovery/proxify/pkg/logger"
 	"github.com/projectdiscovery/proxify/pkg/logger/elastic"
 	"github.com/projectdiscovery/proxify/pkg/logger/kafka"
+	"github.com/projectdiscovery/proxify/pkg/tlsprofile"
 	"github.com/projectdiscovery/proxify/pkg/types"
 	errorutil "github.com/projectdiscovery/utils/errors"
 	fileutil "github.com/projectdiscovery/utils/file"
@@ -59,6 +61,10 @@ type Options struct {
 	MaxSize                     int
 	DisableUpdateCheck          bool // DisableUpdateCheck disables automatic update check
 	OutputJsonl                 bool // OutputJsonl outputs data in JSONL format
+	// TLS Fingerprinting options
+	TLSFingerprint              bool   // Enable TLS fingerprinting
+	TLSProfile                  string // TLS profile to use (e.g., "chrome_120")
+	ListTLSProfiles             bool   // List available TLS profiles and exit
 }
 
 func ParseOptions() (*Options, error) {
@@ -106,6 +112,12 @@ func ParseOptions() (*Options, error) {
 		flagSet.StringSliceVarP(&options.UpstreamHTTPProxies, "http-proxy", "hp", nil, "Upstream HTTP Proxies (eg http://proxy-ip:proxy-port)", goflags.NormalizedStringSliceOptions),
 		flagSet.StringSliceVarP(&options.UpstreamSocks5Proxies, "socks5-proxy", "sp", nil, "Upstream SOCKS5 Proxies (eg socks5://proxy-ip:proxy-port)", goflags.NormalizedStringSliceOptions),
 		flagSet.IntVar(&options.UpstreamProxyRequestsNumber, "c", 1, "Number of requests before switching to the next upstream proxy"),
+	)
+
+	flagSet.CreateGroup("tls", "TLS Fingerprinting",
+		flagSet.BoolVarP(&options.TLSFingerprint, "tls-fingerprint", "tlsf", false, "Enable TLS fingerprinting for upstream connections"),
+		flagSet.StringVarP(&options.TLSProfile, "tls-profile", "tlsp", "chrome_120", "TLS profile to use (chrome_120, firefox_117, safari_16_0, etc.)"),
+		flagSet.BoolVar(&options.ListTLSProfiles, "list-tls-profiles", false, "List available TLS profiles and exit"),
 	)
 
 	flagSet.CreateGroup("export", "Export",
@@ -164,6 +176,16 @@ func ParseOptions() (*Options, error) {
 
 	if options.Version {
 		gologger.Info().Msgf("Current Version: %s\n", version)
+		os.Exit(0)
+	}
+
+	if options.ListTLSProfiles {
+		gologger.Info().Msg("Available TLS Profiles:\n")
+		profiles := tlsprofile.ListProfiles()
+		sort.Strings(profiles)
+		for _, profile := range profiles {
+			gologger.Silent().Msgf("  - %s", profile)
+		}
 		os.Exit(0)
 	}
 
