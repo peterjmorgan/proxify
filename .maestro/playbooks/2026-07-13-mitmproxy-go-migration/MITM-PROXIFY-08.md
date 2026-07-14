@@ -38,7 +38,7 @@ no `time.Sleep` as the sole synchronization.
 
   Verified: `go test -race .` and `go vet ./...` clean.
 
-- [ ] **P12 — HTTP/1 and HTTP/2 protocol matrix (depends on P10).** Add table-driven
+- [x] **P12 — HTTP/1 and HTTP/2 protocol matrix (depends on P10).** Add table-driven
   `TestProtocolMatrix` for H1→H1, H1→H2 TLS, H2→H2, H2→H1 TLS, asserting downstream callback
   `req.Proto` and upstream origin protocol separately. Add two concurrent H2 streams (distinct
   `FlowContext.ID`, one `ConnectionID`). A streaming origin flushes `part1`, blocks, then
@@ -49,6 +49,36 @@ no `time.Sleep` as the sole synchronization.
   `cancelStarted`, `okStarted`, each wait with a 2-second timeout + cleanup. Do Not Modify:
   DSL/logger formats, WebSocket, CLI, HTTP/3 deps. Success: all pairs + isolation + streaming +
   trailers + cancellation pass under `-race`. Full detail: plan.md §Step P12.
+
+  **Done (2026-07-13):** Added `proxy_protocol_test.go` with four E2E tests over the candidate
+  serving core (`Proxy.Run`):
+  - `TestProtocolMatrix` — table-driven H1→H1, H1→H2 TLS, H2→H2, H2→H1 TLS. Downstream protocol
+    is read from the intercepted inner request's `req.Proto` (via `OnRequestCallback`), upstream
+    from the origin's echoed `X-Origin-Proto`; the two are asserted independently. Verified
+    downstream H2 through the MITM leaf negotiates (probe: inner proto `HTTP/2.0`). h2c prior
+    knowledge is a documented-skip subtest: `Proxy.Run` serves a plain `http.Server` with no
+    `h2c` handler, so downstream h2c prior knowledge is not offered by the listener harness.
+  - `TestConcurrentH2StreamsShareConnection` — a warm-up pools one downstream H2 connection, then
+    two concurrent GETs block at the origin until both arrive (simultaneously in flight). Asserts
+    both are `HTTP/2.0`, have distinct non-empty `FlowContext.ID`, and share one `ConnectionID`.
+  - `TestH2StreamingAndTrailers` — H2→H2 streaming origin; client reads `part1` and signals
+    before the test releases `part2`, proving the serving core streams (not buffers); body is
+    `part1part2` and trailer `X-End: done` survives to EOF.
+  - `TestH2StreamCancellationIsolation` — `/ok` and `/cancel` multiplex on one warmed connection;
+    canceling `/cancel`'s context ends it with `context.Canceled` while `/ok` still returns 200
+    `hello`, and only one distinct downstream `ConnectionID` is observed (no new connection).
+
+  **No production changes** (allowed only for observed regressions; none observed). One behavior
+  was investigated and confirmed *not* a regression: on the default (logging) path the streaming
+  test buffers, because `pkg/logger` snapshots the first `responseSnapshotPrefix` (4 KiB) of the
+  response body — `io.CopyN` blocks until 4 KiB or EOF, deferring `part1` past release. That
+  buffering lives in the logger (Do Not Modify) and predates the migration, so the streaming test
+  runs the callback path (no-op `OnRequest`/`OnResponse`) to isolate serving-core streaming, which
+  streams correctly (part1 at ~0.1s, before release). The origin release fallback (8s) is longer
+  than the 2s `part1Seen` wait so a real buffering regression fails the wait rather than being
+  masked.
+
+  Verified: `go test -race .` and `go vet ./...` clean.
 
 - [ ] **P13 — DNS policy, route rotation, TLS modes end-to-end (depends on P10, P6, P7).**
   Through the candidate: DNS mapping `mapped.test → 127.0.0.1` reaches a local origin without
