@@ -2,17 +2,20 @@ package certs
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha1"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/projectdiscovery/gologger"
-	"github.com/projectdiscovery/martian/v3/mitm"
 	fileutil "github.com/projectdiscovery/utils/file"
 )
 
@@ -33,13 +36,14 @@ const (
 	postalCode    = "94104"
 )
 
-// GetMitMConfig returns mitm config for martian
-func GetMitMConfig() *mitm.Config {
-	cfg, err := mitm.NewConfig(cert, pkey)
-	if err != nil {
-		gologger.Fatal().Msgf("failed to create mitm config")
-	}
-	return cfg
+// CACertPath returns the on-disk CA certificate path under dir
+func CACertPath(dir string) string {
+	return filepath.Join(dir, caCertName)
+}
+
+// CAKeyPath returns the on-disk CA private key path under dir
+func CAKeyPath(dir string) string {
+	return filepath.Join(dir, caKeyName)
 }
 
 func SaveCAToFile(filename string) error {
@@ -68,10 +72,67 @@ func SaveKeyToFile(filename string) error {
 	return os.WriteFile(filename, buffer.Bytes(), 0600)
 }
 
+// maxSerialNumber is the upper boundary used to create unique serial numbers
+var maxSerialNumber = big.NewInt(0).SetBytes(bytes.Repeat([]byte{255}, 20))
+
+// newAuthority creates a new CA certificate and private key using the
+// standard library, preserving the exact shape martian's mitm.NewAuthority
+// produced (subject, key usages, SubjectKeyId, backdated NotBefore).
+func newAuthority(name, organization string, validity time.Duration) (*x509.Certificate, *rsa.PrivateKey, error) {
+	priv, err := rsa.GenerateKey(rand.Reader, bits)
+	if err != nil {
+		return nil, nil, err
+	}
+	pub := priv.Public()
+
+	// Subject Key Identifier support for end entity certificate.
+	// https://www.ietf.org/rfc/rfc3280.txt (section 4.2.1.2)
+	pkixpub, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		return nil, nil, err
+	}
+	h := sha1.New()
+	h.Write(pkixpub)
+	keyID := h.Sum(nil)
+
+	serial, err := rand.Int(rand.Reader, maxSerialNumber)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	tmpl := &x509.Certificate{
+		SerialNumber: serial,
+		Subject: pkix.Name{
+			CommonName:   name,
+			Organization: []string{organization},
+		},
+		SubjectKeyId:          keyID,
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		NotBefore:             time.Now().Add(-validity),
+		NotAfter:              time.Now().Add(validity),
+		DNSNames:              []string{name},
+		IsCA:                  true,
+	}
+
+	raw, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, pub, priv)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	x509c, err := x509.ParseCertificate(raw)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return x509c, priv, nil
+}
+
 // generateCertificate creates new certificate
 func generateCertificate(certFile, keyFile string) error {
 	var err error
-	cert, pkey, err = mitm.NewAuthority("Proxify CA", organization, time.Duration(24*365)*time.Hour)
+	cert, pkey, err = newAuthority("Proxify CA", organization, time.Duration(24*365)*time.Hour)
 	if err != nil {
 		gologger.Fatal().Msgf("failed to generate CA Certificate")
 	}
@@ -120,8 +181,8 @@ func readPemFromDisk(filename string) (*pem.Block, error) {
 }
 
 func LoadCerts(dir string) error {
-	certFile := filepath.Join(dir, caCertName)
-	keyFile := filepath.Join(dir, caKeyName)
+	certFile := CACertPath(dir)
+	keyFile := CAKeyPath(dir)
 
 	if !fileutil.FileExists(certFile) || !fileutil.FileExists(keyFile) {
 		return generateCertificate(certFile, keyFile)
