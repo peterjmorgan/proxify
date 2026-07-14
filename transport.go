@@ -8,18 +8,23 @@ package proxify
 // Step P7.
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"sync"
+	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
+	"github.com/bogdanfinn/tls-client/profiles"
 	"github.com/projectdiscovery/fastdialer/fastdialer"
-	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/proxify/pkg/tlsprofile"
 	errorutil "github.com/projectdiscovery/utils/errors"
 	"golang.org/x/net/proxy"
@@ -158,6 +163,17 @@ func (rt *routedRoundTripper) CloseIdleConnections() {
 // distinct route (built by build) plus a routeSelector that picks one route per
 // RoundTrip. Route order and rotateEvery drive the selection sequence.
 func (p *Proxy) newRoutedRoundTripper(routes []string, build func(*fastdialer.Dialer, string) (*http.Transport, error)) (http.RoundTripper, error) {
+	return p.newRoutedRoundTripperFunc(routes, func(route string) (http.RoundTripper, error) {
+		return build(p.Dialer, route)
+	})
+}
+
+// newRoutedRoundTripperFunc is the general form of newRoutedRoundTripper: it
+// builds one RoundTripper per distinct route via build and selects one route per
+// RoundTrip with a P6 routeSelector. The standard transport path (P6) and the
+// tls-client fingerprinting path (P7) share it so route rotation is identical in
+// both modes.
+func (p *Proxy) newRoutedRoundTripperFunc(routes []string, build func(string) (http.RoundTripper, error)) (http.RoundTripper, error) {
 	selector, err := newRouteSelector(routes, p.options.UpstreamProxyRequestsNumber)
 	if err != nil {
 		return nil, err
@@ -167,11 +183,11 @@ func (p *Proxy) newRoutedRoundTripper(routes []string, build func(*fastdialer.Di
 		if _, ok := transports[route]; ok {
 			continue
 		}
-		t, err := build(p.Dialer, route)
+		rt, err := build(route)
 		if err != nil {
 			return nil, err
 		}
-		transports[route] = t
+		transports[route] = rt
 	}
 	return &routedRoundTripper{selector: selector, transports: transports}, nil
 }
@@ -237,21 +253,66 @@ func (f *fastdialerForward) DialContext(ctx context.Context, network, addr strin
 	return f.dialer.Dial(ctx, network, addr)
 }
 
-// getTLSClientRoundTripper returns a bogdanfinn/tls-client RoundTripper with fingerprinting
+// getTLSClientRoundTripper returns a bogdanfinn/tls-client RoundTripper with TLS
+// fingerprinting (Step P7). Upstream HTTP proxies take precedence over SOCKS5;
+// when either is configured a routedRoundTripper (reusing the P6 routeSelector)
+// selects exactly one route per RoundTrip, each route backed by its own
+// tls-client HttpClient. With no upstream proxy a single direct client is used.
+// Every client dials through fastdialer via WithProxyDialerFactory, so the
+// fingerprinted path enforces the same allow/deny/DNS policy as the standard
+// transport and honors upstream route rotation (unlike the previous
+// first-proxy-only implementation).
 func (p *Proxy) getTLSClientRoundTripper() (http.RoundTripper, error) {
-	// Get the TLS profile
 	profile, err := tlsprofile.GetProfile(p.options.TLSProfile)
 	if err != nil {
 		return nil, errorutil.NewWithErr(err).Msgf("failed to get TLS profile")
 	}
+	build := func(route string) (http.RoundTripper, error) {
+		return p.newTLSClientRoundTripper(profile, route)
+	}
+	if len(p.options.UpstreamHTTPProxies) > 0 {
+		return p.newRoutedRoundTripperFunc(p.options.UpstreamHTTPProxies, build)
+	}
+	if len(p.options.UpstreamSock5Proxies) > 0 {
+		routes := make([]string, len(p.options.UpstreamSock5Proxies))
+		for i, raw := range p.options.UpstreamSock5Proxies {
+			routes[i] = ensureSOCKSScheme(raw)
+		}
+		return p.newRoutedRoundTripperFunc(routes, build)
+	}
+	return build("")
+}
 
-	// Build tls-client options
+// ensureSOCKSScheme normalizes an upstream SOCKS5 value to a socks5:// URL so
+// both tls-client's WithProxyUrl (which requires a scheme) and the proxy dialer
+// factory parse it, tolerating bare host:port and already-schemed forms.
+func ensureSOCKSScheme(raw string) string {
+	if u, err := url.Parse(raw); err == nil && u.Scheme != "" {
+		return raw
+	}
+	return "socks5://" + raw
+}
+
+// newTLSClientRoundTripper builds one tls-client HttpClient for a single route
+// (an empty route means direct) and wraps it as an http.RoundTripper.
+//
+// One client per route, selected once per RoundTrip, needs no client pool or
+// global request mutex: tls-client's Do is safe for concurrent use. The only
+// shared mutable state it touches per call is the header-order key, guarded by
+// an internal lock that is released before the underlying (net/http-style)
+// RoundTrip runs, so concurrent H2 streams on one client are never serialized.
+func (p *Proxy) newTLSClientRoundTripper(profile profiles.ClientProfile, route string) (http.RoundTripper, error) {
 	opts := []tls_client.HttpClientOption{
 		tls_client.WithClientProfile(profile),
 		tls_client.WithTimeoutSeconds(30),
 		tls_client.WithInsecureSkipVerify(),
-
-		// Match proxify's connection pooling behavior
+		// Route every socket through fastdialer: a direct client dials the
+		// target, an http(s) route CONNECT-tunnels through the proxy, a socks5
+		// route dials through a SOCKS5 forward dialer — each socket enforcing
+		// fastdialer allow/deny/DNS policy. The factory is used even for direct
+		// clients (empty proxy URL) so fastdialer always owns the dial.
+		tls_client.WithProxyDialerFactory(fastdialerProxyDialerFactory(p.Dialer)),
+		// Match proxify's connection pooling behavior.
 		tls_client.WithTransportOptions(&tls_client.TransportOptions{
 			MaxIdleConns:        0,  // Disable pooling
 			MaxIdleConnsPerHost: -1, // Unlimited
@@ -259,115 +320,332 @@ func (p *Proxy) getTLSClientRoundTripper() (http.RoundTripper, error) {
 			DisableKeepAlives:   false,
 		}),
 	}
-
-	// Handle upstream proxy configuration
-	// NOTE: We use tls-client's built-in proxy support, which means we lose
-	// round-robin load balancing for now. Single upstream proxy only.
-	if len(p.options.UpstreamHTTPProxies) > 0 {
-		// Use first HTTP proxy
-		proxyURL := p.options.UpstreamHTTPProxies[0]
-		opts = append(opts, tls_client.WithProxyUrl(proxyURL))
-
-		if len(p.options.UpstreamHTTPProxies) > 1 {
-			gologger.Warning().Msgf(
-				"TLS fingerprinting mode: using only first upstream HTTP proxy (%s). "+
-					"Round-robin load balancing is not supported with TLS fingerprinting.",
-				proxyURL,
-			)
-		}
-	} else if len(p.options.UpstreamSock5Proxies) > 0 {
-		// Use first SOCKS5 proxy
-		proxyURL := p.options.UpstreamSock5Proxies[0]
-		opts = append(opts, tls_client.WithProxyUrl(proxyURL))
-
-		if len(p.options.UpstreamSock5Proxies) > 1 {
-			gologger.Warning().Msgf(
-				"TLS fingerprinting mode: using only first upstream SOCKS5 proxy (%s). "+
-					"Round-robin load balancing is not supported with TLS fingerprinting.",
-				proxyURL,
-			)
-		}
+	if route != "" {
+		// The factory reads this URL to build the CONNECT/SOCKS proxy dialer.
+		opts = append(opts, tls_client.WithProxyUrl(route))
 	}
-
-	// Create the tls-client
 	client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), opts...)
 	if err != nil {
 		return nil, errorutil.NewWithErr(err).Msgf("failed to create TLS client")
 	}
-
-	// Wrap the client in a RoundTripper adapter
 	return &tlsClientRoundTripper{client: client}, nil
 }
 
-// tlsClientRoundTripper adapts tls_client.HttpClient to http.RoundTripper interface
-// It handles conversion between net/http and fhttp types
+// fastdialerProxyDialerFactory returns a tls_client.ProxyDialerFactory whose
+// dialers are all backed by fastdialer, so the fingerprinted path enforces the
+// same allow/deny/DNS policy as the standard transport. tls-client invokes the
+// factory for every client (including direct ones, with an empty proxyURL):
+//   - empty proxyURL: dial the target directly through fastdialer.
+//   - http(s)://:     open an HTTP CONNECT tunnel, dialing the proxy socket via
+//     fastdialer and sending Basic auth from the URL userinfo.
+//   - socks5(h)://:   dial through a SOCKS5 dialer whose forward dial (the proxy
+//     socket) uses fastdialer, with auth from the URL userinfo.
+func fastdialerProxyDialerFactory(dialer *fastdialer.Dialer) tls_client.ProxyDialerFactory {
+	return func(proxyURL string, timeout time.Duration, _ *net.TCPAddr, _ fhttp.Header, _ tls_client.Logger) (proxy.ContextDialer, error) {
+		if proxyURL == "" {
+			return &fastdialerForward{dialer: dialer}, nil
+		}
+		u, err := url.Parse(proxyURL)
+		if err != nil {
+			return nil, errorutil.NewWithErr(err).Msgf("invalid upstream proxy %q", proxyURL)
+		}
+		if u.Host == "" {
+			return nil, fmt.Errorf("invalid upstream proxy %q: missing host", proxyURL)
+		}
+		switch u.Scheme {
+		case "http", "https":
+			return newConnectContextDialer(dialer, u, timeout), nil
+		case "socks5", "socks5h":
+			return newSOCKSContextDialer(dialer, u)
+		default:
+			return nil, fmt.Errorf("unsupported upstream proxy scheme %q in %q", u.Scheme, proxyURL)
+		}
+	}
+}
+
+// connectContextDialer reaches a target by opening an HTTP CONNECT tunnel
+// through an upstream HTTP(S) proxy. The socket to the proxy is dialed through
+// fastdialer; for an https proxy that socket is wrapped in TLS. The target
+// host:port and Basic-auth credentials from the proxy URL are preserved. Each
+// DialContext builds a fresh tunnel and keeps no shared mutable state, so it is
+// safe for concurrent use.
+type connectContextDialer struct {
+	dialer    *fastdialer.Dialer
+	proxyURL  *url.URL
+	proxyAddr string
+	proxyAuth string // "Basic ..." header value, or "" when unauthenticated
+	useTLS    bool
+	timeout   time.Duration
+}
+
+func newConnectContextDialer(dialer *fastdialer.Dialer, u *url.URL, timeout time.Duration) *connectContextDialer {
+	d := &connectContextDialer{
+		dialer:    dialer,
+		proxyURL:  u,
+		proxyAddr: proxyHostPort(u),
+		useTLS:    u.Scheme == "https",
+		timeout:   timeout,
+	}
+	if u.User != nil {
+		password, _ := u.User.Password()
+		d.proxyAuth = "Basic " + base64.StdEncoding.EncodeToString([]byte(u.User.Username()+":"+password))
+	}
+	return d
+}
+
+// Dial implements proxy.Dialer.
+func (d *connectContextDialer) Dial(network, addr string) (net.Conn, error) {
+	return d.DialContext(context.Background(), network, addr)
+}
+
+// DialContext implements proxy.ContextDialer, establishing the CONNECT tunnel to
+// addr (the target host:port) through the upstream proxy.
+func (d *connectContextDialer) DialContext(ctx context.Context, network, addr string) (conn net.Conn, err error) {
+	conn, err = d.dialer.Dial(ctx, network, d.proxyAddr)
+	if err != nil {
+		return nil, err
+	}
+	// Any failure after a successful proxy dial must close the proxy socket.
+	defer func() {
+		if err != nil && conn != nil {
+			_ = conn.Close()
+		}
+	}()
+
+	if d.useTLS {
+		tlsConn := tls.Client(conn, &tls.Config{
+			ServerName:         d.proxyURL.Hostname(),
+			InsecureSkipVerify: true,
+			NextProtos:         []string{"http/1.1"},
+		})
+		if err = tlsConn.HandshakeContext(ctx); err != nil {
+			return nil, err
+		}
+		conn = tlsConn
+	}
+
+	// The proxy dial (via fastdialer) and the TLS handshake above already honor
+	// ctx cancellation. Bound the blocking CONNECT exchange itself with the
+	// client timeout so a silent proxy cannot hang the dial.
+	if d.timeout > 0 {
+		if err = conn.SetDeadline(time.Now().Add(d.timeout)); err != nil {
+			return nil, err
+		}
+	}
+
+	req := &fhttp.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{Host: addr},
+		Host:   addr,
+		Header: make(fhttp.Header),
+	}
+	if d.proxyAuth != "" {
+		req.Header.Set("Proxy-Authorization", d.proxyAuth)
+	}
+	if err = req.Write(conn); err != nil {
+		return nil, err
+	}
+	br := bufio.NewReader(conn)
+	resp, err := fhttp.ReadResponse(br, req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		err = fmt.Errorf("connect via %s failed: %s", d.proxyAddr, resp.Status)
+		return nil, err
+	}
+
+	// Clear the handshake deadline before handing the tunnel to the caller.
+	if err = conn.SetDeadline(time.Time{}); err != nil {
+		return nil, err
+	}
+	// Read through the bufio.Reader so any bytes it buffered past the 200 (the
+	// start of the tunneled stream) are not lost; writes still go to conn.
+	return &bufferedConn{Conn: conn, r: br}, nil
+}
+
+// bufferedConn preserves bytes a bufio.Reader read past the CONNECT response so
+// the tunneled stream stays intact. Reads come from the reader; every other
+// operation delegates to the embedded conn.
+type bufferedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) { return c.r.Read(p) }
+
+// newSOCKSContextDialer builds a proxy.ContextDialer that reaches the target
+// through a SOCKS5 proxy whose forward dial (the socket to the proxy) goes
+// through fastdialer. Credentials from the URL userinfo are preserved.
+func newSOCKSContextDialer(dialer *fastdialer.Dialer, u *url.URL) (proxy.ContextDialer, error) {
+	var auth *proxy.Auth
+	if u.User != nil {
+		password, _ := u.User.Password()
+		auth = &proxy.Auth{User: u.User.Username(), Password: password}
+	}
+	socksDialer, err := proxy.SOCKS5("tcp", u.Host, auth, &fastdialerForward{dialer: dialer})
+	if err != nil {
+		return nil, errorutil.NewWithErr(err).Msgf("invalid upstream SOCKS5 proxy %q", u.Redacted())
+	}
+	if cd, ok := socksDialer.(proxy.ContextDialer); ok {
+		return cd, nil
+	}
+	return &dialerContextAdapter{dialer: socksDialer}, nil
+}
+
+// dialerContextAdapter adds a context-aware DialContext to a proxy.Dialer that
+// lacks one, falling back to its context-free Dial.
+type dialerContextAdapter struct {
+	dialer proxy.Dialer
+}
+
+// Dial implements proxy.Dialer.
+func (a *dialerContextAdapter) Dial(network, addr string) (net.Conn, error) {
+	return a.dialer.Dial(network, addr)
+}
+
+// DialContext implements proxy.ContextDialer.
+func (a *dialerContextAdapter) DialContext(_ context.Context, network, addr string) (net.Conn, error) {
+	return a.dialer.Dial(network, addr)
+}
+
+// proxyHostPort returns the host:port of an HTTP(S) proxy URL, defaulting the
+// port to 443 for https and 80 otherwise when absent.
+func proxyHostPort(u *url.URL) string {
+	if u.Port() != "" {
+		return u.Host
+	}
+	if u.Scheme == "https" {
+		return net.JoinHostPort(u.Hostname(), "443")
+	}
+	return net.JoinHostPort(u.Hostname(), "80")
+}
+
+// tlsClientRoundTripper adapts tls_client.HttpClient to http.RoundTripper,
+// converting between net/http and fhttp types while preserving the request
+// context, Host, body, trailers, and the Response.Request linkage.
 type tlsClientRoundTripper struct {
 	client tls_client.HttpClient
 }
 
-// RoundTrip implements the http.RoundTripper interface
+// RoundTrip implements http.RoundTripper.
 func (t *tlsClientRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	// Convert net/http.Request to fhttp.Request
-	fReq := convertToFHTTPRequest(req)
-
-	// Execute request with tls-client
+	fReq, err := convertToFHTTPRequest(req)
+	if err != nil {
+		return nil, err
+	}
 	fResp, err := t.client.Do(fReq)
 	if err != nil {
 		return nil, err
 	}
-
-	// Convert fhttp.Response back to net/http.Response
-	return convertFromFHTTPResponse(fResp), nil
+	return convertFromFHTTPResponse(fResp, req), nil
 }
 
-// convertToFHTTPRequest converts a net/http.Request to fhttp.Request
-func convertToFHTTPRequest(req *http.Request) *fhttp.Request {
-	// Create fhttp request with same parameters
-	fReq, _ := fhttp.NewRequest(req.Method, req.URL.String(), req.Body)
+// CloseIdleConnections releases idle connections on the underlying tls-client.
+func (t *tlsClientRoundTripper) CloseIdleConnections() {
+	t.client.CloseIdleConnections()
+}
 
-	// Copy headers
-	fReq.Header = make(fhttp.Header)
-	for k, v := range req.Header {
-		fReq.Header[k] = v
+// convertToFHTTPRequest converts a net/http.Request to an fhttp.Request. It
+// carries the request context and copies headers and trailers into fresh maps
+// (values copied, not aliased) so the two requests never share mutable state.
+func convertToFHTTPRequest(req *http.Request) (*fhttp.Request, error) {
+	fReq, err := fhttp.NewRequestWithContext(req.Context(), req.Method, req.URL.String(), req.Body)
+	if err != nil {
+		return nil, errorutil.NewWithErr(err).Msgf("failed to build fhttp request")
 	}
-
-	// Copy other important fields
+	fReq.Header = cloneToFHTTPHeader(req.Header)
 	fReq.Host = req.Host
 	fReq.ContentLength = req.ContentLength
-	fReq.TransferEncoding = req.TransferEncoding
+	fReq.TransferEncoding = append([]string(nil), req.TransferEncoding...)
 	fReq.Close = req.Close
-	fReq.Trailer = fhttp.Header(req.Trailer)
-
-	return fReq
+	if req.Trailer != nil {
+		fReq.Trailer = cloneToFHTTPHeader(req.Trailer)
+	}
+	return fReq, nil
 }
 
-// convertFromFHTTPResponse converts an fhttp.Response to net/http.Response
-func convertFromFHTTPResponse(fResp *fhttp.Response) *http.Response {
+// convertFromFHTTPResponse converts an fhttp.Response to a net/http.Response,
+// setting Request to the effective net/http request and copying headers into a
+// fresh map. Trailers are populated only after the body is read, so they are
+// synced from the fhttp response when the body reaches EOF or is closed rather
+// than copied here (which would capture only the empty declared keys).
+func convertFromFHTTPResponse(fResp *fhttp.Response, req *http.Request) *http.Response {
 	resp := &http.Response{
 		Status:           fResp.Status,
 		StatusCode:       fResp.StatusCode,
 		Proto:            fResp.Proto,
 		ProtoMajor:       fResp.ProtoMajor,
 		ProtoMinor:       fResp.ProtoMinor,
-		Body:             fResp.Body,
 		ContentLength:    fResp.ContentLength,
-		TransferEncoding: fResp.TransferEncoding,
+		TransferEncoding: append([]string(nil), fResp.TransferEncoding...),
 		Close:            fResp.Close,
 		Uncompressed:     fResp.Uncompressed,
-		Request:          nil, // We'll set this if needed
+		Request:          req,
 	}
+	resp.Header = cloneFromFHTTPHeader(fResp.Header)
 
-	// Convert headers
-	resp.Header = make(http.Header)
-	for k, v := range fResp.Header {
-		resp.Header[k] = v
+	// Pre-declare any trailer keys the response already advertised; their values
+	// are filled by trailerSyncBody once the body is drained.
+	resp.Trailer = cloneFromFHTTPHeader(fResp.Trailer)
+	body := fResp.Body
+	if body == nil {
+		body = http.NoBody
 	}
-
-	// Convert trailer
-	resp.Trailer = make(http.Header)
-	for k, v := range fResp.Trailer {
-		resp.Trailer[k] = v
-	}
-
+	resp.Body = &trailerSyncBody{body: body, fResp: fResp, dst: resp.Trailer}
 	return resp
+}
+
+// cloneToFHTTPHeader copies a net/http.Header into a fresh fhttp.Header,
+// duplicating value slices so the result shares no mutable state with the input.
+func cloneToFHTTPHeader(h http.Header) fhttp.Header {
+	out := make(fhttp.Header, len(h))
+	for k, v := range h {
+		out[k] = append([]string(nil), v...)
+	}
+	return out
+}
+
+// cloneFromFHTTPHeader copies an fhttp.Header into a fresh net/http.Header,
+// duplicating value slices. The result is always non-nil.
+func cloneFromFHTTPHeader(h fhttp.Header) http.Header {
+	out := make(http.Header, len(h))
+	for k, v := range h {
+		out[k] = append([]string(nil), v...)
+	}
+	return out
+}
+
+// trailerSyncBody wraps the fhttp response body and copies the response's
+// trailers into dst once the body reaches EOF or is closed. HTTP trailers are
+// only known after the body is fully read, so this defers the copy instead of
+// aliasing fResp.Trailer.
+type trailerSyncBody struct {
+	body  io.ReadCloser
+	fResp *fhttp.Response
+	dst   http.Header
+	once  sync.Once
+}
+
+func (b *trailerSyncBody) syncTrailers() {
+	b.once.Do(func() {
+		for k, v := range b.fResp.Trailer {
+			b.dst[k] = append([]string(nil), v...)
+		}
+	})
+}
+
+func (b *trailerSyncBody) Read(p []byte) (int, error) {
+	n, err := b.body.Read(p)
+	if errors.Is(err, io.EOF) {
+		b.syncTrailers()
+	}
+	return n, err
+}
+
+func (b *trailerSyncBody) Close() error {
+	err := b.body.Close()
+	b.syncTrailers()
+	return err
 }
