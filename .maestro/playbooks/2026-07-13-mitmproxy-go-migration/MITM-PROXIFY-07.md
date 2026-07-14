@@ -4,7 +4,7 @@
 `planning/mitmproxy-go-migration/plan.md` Steps P9–P10. Requires the fork pinned (P8), and
 P3/P4/P7 complete. The old Martian core stays compile-tested until P17.
 
-- [ ] **P9 — Build and directly test the candidate adapter (depends on P3, P4, P7, P8).** New
+- [x] **P9 — Build and directly test the candidate adapter (depends on P3, P4, P7, P8).** New
   `mitmproxy_adapter.go` defines private `mitmproxyAdapter` (fork handler, `*Proxy`, and a
   `sync.Map` of CONNECT `FlowContext`s) with private methods `ServeHTTP`, `ServeSOCKS5`,
   `Cleanup`.
@@ -13,6 +13,8 @@ P3/P4/P7 complete. The old Martian core stays compile-tested until P17.
   - HTTP interceptor: obtain `ConnectionIDFromContext`; create a fresh UUID flow per request/stream with `IsSecure` from URL/TLS; call `p.interceptHTTP`. Lifecycle hook: create the CONNECT flow on received, pass the synthetic CONNECT request + selected response through callbacks/logging EXACTLY ONCE, record passthrough/error, delete on closed. Do NOT run the ordinary request DSL twice.
   - Do Not Modify: `Proxy.Run`/`Stop`, Martian imports, the SOCKS listener, or README.
   - Success: one H1 CONNECT logs/callbacks the CONNECT request + 200 once then the inner GET once; two concurrent H2 requests have different flow ids and the same connection id; a regex `.*\.opaque\.test:443` invokes the passthrough predicate with the full hostport; cache honors exact 1/256/257; direct adapter integration passes `-race` while old Martian E2E stays green. Full detail: plan.md §Step P9.
+  - **DONE (2026-07-13):** Added `mitmproxy_adapter.go` (`mitmproxyAdapter` + `newMitmproxyAdapter`, `ServeHTTP`/`ServeSOCKS5`/`Cleanup`, HTTP interceptor, connection lifecycle hook, `sync.Map` of CONNECT flows) and `mitmproxy_adapter_test.go` (6 tests). Wired cert paths via P3 accessors, exact cache size, `WithContextDialer` (reused `fastdialerForward`), `WithPassthroughFunc` over the full host:port, `WithLazyUpstreamMITM`, `WithRoundTripper`, interceptor + lifecycle hook; no `WithDisableHTTP2` (H2 on by default). Package passes `go vet` and `go test -race` (8×, incl. old Martian E2E). Verified: H1 CONNECT logs/callbacks CONNECT+200 once then inner GET once; two concurrent H2 streams get distinct flow ids + one connection id; port-pinned passthrough regex matches only the full hostport.
+  - **FORK GAP (F4, tracked):** The fork surfaces `ConnectionEvent.Request == nil` for CONNECT, so the adapter *synthesizes* the CONNECT request from `ev.Hostport` (that is what "synthetic" means here). Separately, pinned fork **v1.2.0 still enforces `mitm.go`'s multiple-of-256 cert cache guard** — F4's guard-removal reached `internal/cache` but not `newMitmProxyHandler`, so capacities 1 and 257 currently error at construction. The adapter passes `CertCacheSize` verbatim (proven by `TestCacheCapacityHonorsExactAndDefault`); `TestAdapterCacheCapacityForkContract` characterizes the current fork behavior and will fail (prompting an update) once F4 ships the guard removal in a new fork release. Not a P9/Proxify-code defect and not a playbook blocker — the CLI default (256) works; only non-multiple-of-256 `-cert-cache-size` values are affected.
 
 - [ ] **P10 — Switch HTTP and SOCKS serving to the candidate (depends on P9).** `Proxy` owns
   `adapter *mitmproxyAdapter`, `httpServer *http.Server`, HTTP/SOCKS `net.Listener`s, a

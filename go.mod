@@ -42,7 +42,7 @@ require (
 	github.com/klauspost/pgzip v1.2.6 // indirect
 	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect
 	github.com/mholt/archiver/v3 v3.5.1 // indirect
-	github.com/peterjmorgan/mitmproxy-go v1.2.0 // indirect; P8 pin — imported starting at P9; do NOT run `go mod tidy` before then or this require is dropped
+	github.com/peterjmorgan/mitmproxy-go v1.2.0 // P8 pin — imported starting at P9; do NOT run `go mod tidy` before then or this require is dropped
 	github.com/power-devops/perfstat v0.0.0-20210106213030-5aafc221ea8c // indirect
 	github.com/projectdiscovery/machineid v0.0.0-20240226150047-2e2c51e35983 // indirect
 	github.com/quic-go/qpack v0.5.1 // indirect
