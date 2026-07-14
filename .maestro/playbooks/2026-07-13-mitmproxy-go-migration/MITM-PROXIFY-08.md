@@ -129,6 +129,49 @@ no `time.Sleep` as the sole synchronization.
   client (do not add a second server framework). Do Not Modify: frame payload API, upstream
   transport selection, logger formats. Full detail: plan.md §Step P14.
 
+  **BLOCKED (2026-07-14) — left unchecked: two required scenarios fail on a fork defect I cannot
+  fix from the Proxify repo.** Added the fixture and tests; 2 of 4 scenarios pass, 2 are skipped
+  pending a fork fix.
+
+  Landed:
+  - `internal/testutil/proxytest/websocket.go` — new `NewWebSocketOrigin(t, WSConfig)` echo origin
+    (ws:// or wss://) built on the candidate's gorilla-compatible `github.com/josexy/websocket`
+    (no second server framework). It can require an upgrade-request header, add a 101 response
+    header, echo `ping`→`pong`, and exposes `Hits`/`Exits` atomics for hit-count and teardown
+    assertions.
+  - `proxy_websocket_test.go` — 4 E2E tests over the serving core (`Proxy.Run`) with both an HTTP
+    proxy and the native SOCKS5 listener:
+    - **PASS `TestListenerSharedPolicy`** — HTTP proxy and SOCKS5 run the *same* policy: for both a
+      plain-HTTP origin and a MITM'd HTTPS origin, a request-header mutation reaches the origin and
+      a response-header mutation reaches the client, and the request/response callbacks each fire.
+    - **PASS `TestWebSocketCallbackRejectionNeverReachesOrigin`** — a request callback that rejects a
+      WS upgrade short-circuits before any origin dial (origin hit count 0) on both listeners. This
+      is Proxify's callback-level form of the spec's "synthetic 403 rejects upgrade, origin hit
+      count zero": the public callback API rejects by returning an error, stopping the pipeline
+      before the upstream WebSocket dial.
+    - **SKIP `TestWebSocketInterception`** (X-Handshake→origin, X-Origin+X-Response→client, ping→pong)
+      and **SKIP `TestWebSocketRelayTeardownOnClientClose`** (client-close tears down the relay, no
+      goroutine leak) — both need a *successful* MITM'd WS relay, which panics in the fork.
+
+  Fork defect (root cause): in `github.com/peterjmorgan/mitmproxy-go` v1.2.0,
+  `handleTunnelRequest` sets `var dstConn net.Conn = connCtx.remote` (mitm.go:1270). Under
+  `WithLazyUpstreamMITM` (which the adapter uses) `connCtx.remote` is an un-dialed
+  `*remoteClientConn`, so `dstConn` is a non-nil interface wrapping a typed-nil pointer.
+  `relayConnForWS`'s invoker then reads `if upstream == nil` (mitm.go:1856) as false and writes the
+  upstream handshake to the nil conn → nil-pointer panic, instead of lazily dialing. The fork's own
+  tests miss this: they cover eager+WS+success and lazy+WS+reject (reject never invokes the upstream
+  dial). This contradicts fork step **F7**'s "successful `ping`→`pong` relays in eager and lazy
+  modes" success criterion, so the fix belongs to the fork track (patch `relayConnForWS` to treat an
+  un-dialed remote as needing a lazy dial, then re-pin the fork), not Proxify. `t.Skip` on the two
+  tests names the exact fix so they flip to active once the fork is re-pinned.
+
+  No Proxify production changes: the only sound fix is in the fork; dropping `WithLazyUpstreamMITM`
+  to sidestep the panic would revert the P9/P10 TLS-termination model and is not acceptable.
+
+  Verified: `go test -race .` (full root package, ~9.8s) and `go vet ./...` clean with the two
+  fork-blocked tests skipped. Left `- [ ]` because the successful-relay and teardown scenarios
+  (spec's scenarios 15–16) do not yet pass.
+
 - [ ] **P15 — Make logger shutdown drain safely (depends on P11).** In `pkg/logger/logger.go`
   add a producer/close mutex, `closeOnce`, and a worker `WaitGroup`. `LogRequest`/`LogResponse`
   either enqueue while open or return a new package error `ErrLoggerClosed`. `Close` marks closed
