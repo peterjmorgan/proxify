@@ -8,10 +8,12 @@ require (
 	github.com/Knetic/govaluate v3.0.0+incompatible
 	github.com/Shopify/sarama v1.38.1
 	github.com/asaskevich/govalidator v0.0.0-20230301143203-a9d515a09cc2
+	github.com/bogdanfinn/fhttp v0.6.2
 	github.com/bogdanfinn/tls-client v1.11.2
 	github.com/elastic/go-elasticsearch/v7 v7.17.10
 	github.com/elazarl/goproxy v0.0.0-20221015165544-a0805db90819
 	github.com/goccy/go-yaml v1.11.3
+	github.com/google/uuid v1.6.0
 	github.com/haxii/fastproxy v0.5.37
 	github.com/pkg/errors v0.9.1
 	github.com/projectdiscovery/dsl v0.3.19
@@ -30,7 +32,6 @@ require (
 require (
 	github.com/alecthomas/chroma/v2 v2.14.0 // indirect
 	github.com/bits-and-blooms/bitset v1.13.0 // indirect
-	github.com/bogdanfinn/fhttp v0.6.2 // indirect
 	github.com/bogdanfinn/quic-go-utls v1.0.4-utls // indirect
 	github.com/bogdanfinn/utls v1.7.4-barnius // indirect
 	github.com/charmbracelet/lipgloss v0.13.0 // indirect
@@ -39,7 +40,6 @@ require (
 	github.com/gaissmai/bart v0.9.5 // indirect
 	github.com/go-ole/go-ole v1.2.6 // indirect
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/klauspost/pgzip v1.2.6 // indirect
 	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect
 	github.com/mholt/archiver/v3 v3.5.1 // indirect

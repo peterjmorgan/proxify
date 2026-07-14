@@ -16,10 +16,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/projectdiscovery/martian/v3"
 	"github.com/projectdiscovery/proxify/internal/testutil/proxytest"
 	"github.com/projectdiscovery/proxify/pkg/certs"
 	"github.com/projectdiscovery/proxify/pkg/logger/elastic"
@@ -175,13 +175,11 @@ func TestCharacterizeHTTPSConnectMITM(t *testing.T) {
 func TestCharacterizeCallbacks(t *testing.T) {
 	origin := proxytest.NewPlainOrigin(t, helloHandler())
 	proxyURL, _, _ := startProxy(t, func(o *Options) {
-		// NOTE: callback signatures expose *martian.Context today; plan step
-		// P2 intentionally breaks this to *FlowContext and updates this test.
-		o.OnRequestCallback = func(req *http.Request, _ *martian.Context) error {
+		o.OnRequestCallback = func(req *http.Request, _ *FlowContext) error {
 			req.Header.Set("X-Test", "request")
 			return nil
 		}
-		o.OnResponseCallback = func(resp *http.Response, _ *martian.Context) error {
+		o.OnResponseCallback = func(resp *http.Response, _ *FlowContext) error {
 			resp.Header.Set("X-Test", "response")
 			return nil
 		}
@@ -199,6 +197,74 @@ func TestCharacterizeCallbacks(t *testing.T) {
 	}
 	if got := resp.Header.Get("X-Test"); got != "response" {
 		t.Fatalf("client saw X-Test = %q, want %q (response callback)", got, "response")
+	}
+}
+
+// TestCharacterizeFlowContextSharedAcrossCallbacks: the *FlowContext handed to
+// the request callback is the SAME pointer handed to the response callback, so
+// a value set on the request side is readable on the response side. This is the
+// engine-neutral replacement for the old shared *martian.Context (plan P2).
+func TestCharacterizeFlowContextSharedAcrossCallbacks(t *testing.T) {
+	origin := proxytest.NewPlainOrigin(t, helloHandler())
+	proxyURL, _, _ := startProxy(t, func(o *Options) {
+		o.OnRequestCallback = func(req *http.Request, ctx *FlowContext) error {
+			ctx.Set("callback-value", "seen")
+			return nil
+		}
+		o.OnResponseCallback = func(resp *http.Response, ctx *FlowContext) error {
+			if v, ok := ctx.Get("callback-value"); ok {
+				resp.Header.Set("X-Flow-Shared", fmt.Sprint(v))
+			}
+			return nil
+		}
+	})
+	client := proxytest.ProxyClient(t, proxyURL, nil, false)
+
+	resp, err := client.Get(origin.URL + "/hello")
+	if err != nil {
+		t.Fatalf("GET via proxy: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if got := resp.Header.Get("X-Flow-Shared"); got != "seen" {
+		t.Fatalf("response callback read shared value %q, want %q (same FlowContext pointer)", got, "seen")
+	}
+}
+
+// TestCharacterizeFlowContextDistinctIDs: separate transactions receive
+// distinct, non-empty flow IDs.
+func TestCharacterizeFlowContextDistinctIDs(t *testing.T) {
+	origin := proxytest.NewPlainOrigin(t, helloHandler())
+	var mu sync.Mutex
+	var ids []string
+	proxyURL, _, _ := startProxy(t, func(o *Options) {
+		o.OnRequestCallback = func(req *http.Request, ctx *FlowContext) error {
+			mu.Lock()
+			ids = append(ids, ctx.ID())
+			mu.Unlock()
+			return nil
+		}
+	})
+	client := proxytest.ProxyClient(t, proxyURL, nil, false)
+
+	for i := 0; i < 2; i++ {
+		resp, err := client.Get(origin.URL + "/hello")
+		if err != nil {
+			t.Fatalf("GET #%d via proxy: %v", i, err)
+		}
+		_ = resp.Body.Close()
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(ids) != 2 {
+		t.Fatalf("captured %d flow ids, want 2", len(ids))
+	}
+	if ids[0] == "" || ids[1] == "" {
+		t.Fatalf("flow ids must be non-empty, got %q and %q", ids[0], ids[1])
+	}
+	if ids[0] == ids[1] {
+		t.Fatalf("flow ids not distinct across requests: both %q", ids[0])
 	}
 }
 

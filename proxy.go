@@ -43,8 +43,8 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-type OnRequestFunc func(req *http.Request, ctx *martian.Context) error
-type OnResponseFunc func(resp *http.Response, ctx *martian.Context) error
+type OnRequestFunc func(req *http.Request, ctx *FlowContext) error
+type OnResponseFunc func(resp *http.Response, ctx *FlowContext) error
 
 type Options struct {
 	DumpRequest                 bool
@@ -204,6 +204,10 @@ func NewProxy(options *Options) (*Proxy, error) {
 	return proxy, nil
 }
 
+// flowContextKey is the private martian-context key under which the per-flow
+// *FlowContext is stored by ModifyRequest and retrieved by ModifyResponse.
+const flowContextKey = "proxify-flow-context"
+
 // ModifyRequest
 func (p *Proxy) ModifyRequest(req *http.Request) error {
 	// // Set Content-Length to zero to allow automatic calculation
@@ -212,9 +216,18 @@ func (p *Proxy) ModifyRequest(req *http.Request) error {
 	ctx := martian.NewContext(req)
 	// disable upgrading http connections to https by default
 	ctx.Session().MarkInsecure()
+
+	// Build the engine-neutral flow context. Until a protocol adapter supplies
+	// distinct identifiers (migration P4+), the martian context ID is used for
+	// both the flow and connection id. req.TLS is set by the serving engine for
+	// TLS-terminated (MITM'd) flows; the martian fork leaves the session's own
+	// secure flag disabled, so req.TLS is the reliable signal here.
+	flow := newFlowContext(ctx.ID(), ctx.ID(), req.TLS != nil)
+	ctx.Set(flowContextKey, flow)
+
 	// setup passthrought and hijack here
 	userData := types.UserData{
-		ID:   ctx.ID(),
+		ID:   flow.ID(),
 		Host: req.Host,
 	}
 
@@ -225,7 +238,7 @@ func (p *Proxy) ModifyRequest(req *http.Request) error {
 
 	// If callbacks are given use them (for library use cases)
 	if p.options.OnRequestCallback != nil {
-		return p.options.OnRequestCallback(req, ctx)
+		return p.options.OnRequestCallback(req, flow)
 	}
 
 	boolSlice := []bool{}
@@ -264,6 +277,11 @@ func (*Proxy) removeBrEncoding(req *http.Request) {
 // ModifyResponse
 func (p *Proxy) ModifyResponse(resp *http.Response) error {
 	ctx := martian.NewContext(resp.Request)
+	// Retrieve the same *FlowContext created for this flow in ModifyRequest.
+	var flow *FlowContext
+	if w, ok := ctx.Get(flowContextKey); ok {
+		flow, _ = w.(*FlowContext)
+	}
 	var userData *types.UserData
 	if w, ok := ctx.Get("user-data"); ok {
 		if data, ok2 := w.(types.UserData); ok2 {
@@ -284,7 +302,12 @@ func (p *Proxy) ModifyResponse(resp *http.Response) error {
 
 	// If callbacks are given use them (for library use cases)
 	if p.options.OnResponseCallback != nil {
-		return p.options.OnResponseCallback(resp, ctx)
+		if flow == nil {
+			// No request-side flow context (e.g. response without a tracked
+			// request); provide a fresh one so callbacks never receive nil.
+			flow = newFlowContext("", "", resp.TLS != nil)
+		}
+		return p.options.OnResponseCallback(resp, flow)
 	}
 
 	boolSlice := []bool{}
