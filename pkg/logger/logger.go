@@ -1,6 +1,9 @@
 package logger
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -105,10 +108,11 @@ func (l *Logger) LogRequest(req *http.Request, userdata types.UserData) error {
 		return nil
 	}
 
-	// send to writer channel
+	// Snapshot while this goroutine still has exclusive access: the async
+	// writer must never touch the live request the proxy is about to forward.
 	l.asyncqueue <- types.HTTPTransaction{
 		Userdata: userdata,
-		Request:  req,
+		Request:  snapshotRequest(req),
 	}
 	return nil
 }
@@ -118,13 +122,103 @@ func (l *Logger) LogResponse(resp *http.Response, userdata types.UserData) error
 	if resp == nil {
 		return nil
 	}
-	// send to writer channel
+	// Snapshot while this goroutine still has exclusive access: the async
+	// writer must never touch the live response the proxy is still writing
+	// to the client, nor fields callers mutate after logging (resp.Close).
+	snapshot := snapshotResponse(resp)
 	l.asyncqueue <- types.HTTPTransaction{
 		Userdata: userdata,
-		Response: resp,
-		Request:  resp.Request,
+		Response: snapshot,
+		Request:  snapshot.Request,
 	}
 	return nil
+}
+
+// responseSnapshotPrefix is how much of a response body is buffered into a
+// snapshot: the ResponseChain in AsyncWrite caps body reads at 4096 bytes,
+// +1 so oversized bodies still trip its too-large error path.
+const responseSnapshotPrefix = 4096 + 1
+
+// errReader replays a read error to whichever side owns the tail of a
+// snapshotted body, so a mid-body failure is not silently converted to EOF.
+type errReader struct{ err error }
+
+func (e *errReader) Read([]byte) (int, error) { return 0, e.err }
+
+// compositeBody pairs a replacement body reader with the closer of the
+// original body it wraps, so closing the live body still releases the
+// underlying connection.
+type compositeBody struct {
+	io.Reader
+	io.Closer
+}
+
+// snapshotRequest returns a copy of req that the async writer can consume
+// without touching state the serving goroutines still own. The body is read
+// synchronously here, while the caller has exclusive access, and the live
+// request and the copy get independent readers over the same bytes.
+func snapshotRequest(req *http.Request) *http.Request {
+	clone := req.Clone(context.Background())
+	// Never share the rewind func across the ownership boundary.
+	clone.GetBody = nil
+	if req.Body == nil || req.Body == http.NoBody {
+		return clone
+	}
+	body, err := io.ReadAll(req.Body)
+	_ = req.Body.Close()
+	live := io.Reader(bytes.NewReader(body))
+	snap := io.Reader(bytes.NewReader(body))
+	if err != nil {
+		live = io.MultiReader(live, &errReader{err: err})
+		snap = io.MultiReader(snap, &errReader{err: err})
+	}
+	req.Body = io.NopCloser(live)
+	clone.Body = io.NopCloser(snap)
+	return clone
+}
+
+// snapshotResponse returns a copy of resp safe for the async writer. Only the
+// first responseSnapshotPrefix bytes of the body are buffered (all AsyncWrite
+// ever reads is the 4096-capped ResponseChain); the live response replays the
+// buffered prefix and then keeps streaming from the original body.
+func snapshotResponse(resp *http.Response) *http.Response {
+	clone := new(http.Response)
+	*clone = *resp
+	// Invariant: fields still aliased after this shallow copy (TransferEncoding,
+	// TLS, Request.Response) must never be written after LogResponse enqueues
+	// the snapshot; only Close, Header, Trailer, Body, and Request are known to
+	// be touched post-log, and those are deep-copied below.
+	clone.Header = resp.Header.Clone()
+	clone.Trailer = resp.Trailer.Clone()
+	if resp.Request != nil {
+		clone.Request = snapshotRequest(resp.Request)
+	}
+	if resp.Body == nil || resp.Body == http.NoBody {
+		return clone
+	}
+	orig := resp.Body
+	var prefix bytes.Buffer
+	_, err := io.CopyN(&prefix, orig, responseSnapshotPrefix)
+	switch {
+	case err == nil:
+		// More body remains: the client resumes streaming after the prefix.
+		resp.Body = &compositeBody{
+			Reader: io.MultiReader(bytes.NewReader(prefix.Bytes()), orig),
+			Closer: orig,
+		}
+	case errors.Is(err, io.EOF):
+		resp.Body = &compositeBody{
+			Reader: bytes.NewReader(prefix.Bytes()),
+			Closer: orig,
+		}
+	default:
+		resp.Body = &compositeBody{
+			Reader: io.MultiReader(bytes.NewReader(prefix.Bytes()), &errReader{err: err}),
+			Closer: orig,
+		}
+	}
+	clone.Body = io.NopCloser(bytes.NewReader(prefix.Bytes()))
+	return clone
 }
 
 // AsyncWrite data

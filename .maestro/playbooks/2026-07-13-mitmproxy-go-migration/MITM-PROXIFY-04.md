@@ -39,5 +39,25 @@ DNS or internet.
   - Success: `LoadCerts(tempDir)` creates both exact filenames with a valid matching CA/key; a second `LoadCerts` preserves file hashes/mtimes; `SaveCAToFile` output equals `GetRawCA`; expired cert returns the documented error; cert core has no Martian import and current proxy tests still pass. Full detail: plan.md §Step P3.
   - ✅ **DONE 2026-07-13** — `mitm.go`: martian import removed; `CACertPath`/`CAKeyPath` added (LoadCerts now uses them, so accessors point at the exact files it writes); `newAuthority` replicates martian's `mitm.NewAuthority` line-for-line via stdlib (CN+DNSNames `Proxify CA`, SHA-1 SubjectKeyId of PKIX pubkey, serial < 2^160, KeyEncipherment|DigitalSignature|CertSign + ServerAuth, backdated NotBefore, 2048 bits, 1-year validity; PEM formats/0600 unchanged). `GetMitMConfig` moved verbatim to new bridge `pkg/certs/martian.go` (proxy.go:513 still builds). New `mitm_test.go`: 6 tests covering all success probes + full authority-shape parity (NotBefore backdating, SubjectKeyId, DNSNames, serial bound). `go build`/`vet`/`test ./...` clean; `go test -race ./pkg/certs/` clean. Forge review: CLEAN (parity verified line-by-line against martian mitm.go:65-117); its one low-severity finding — 4 untested parity properties — closed with added assertions. Root `go test -race ./.` still blocked by pre-existing logger race (P1 FINDING), untouched by P3.
 
-- [ ] Run `go test ./...`, `go test -race ./...`, and `go vet ./...`; all clean before Proxify
+- [x] Run `go test ./...`, `go test -race ./...`, and `go vet ./...`; all clean before Proxify
   Phase 5.
+  - ✅ **DONE 2026-07-13** — all three gates exit 0, zero `WARNING: DATA RACE` (stress-verified
+    `-race -count=3` root + `-count=5` pkg/logger). Unblocked by fixing the P1-FINDING logger race
+    at its ingestion point: `LogRequest`/`LogResponse` (pkg/logger/logger.go) now snapshot
+    synchronously before enqueueing — `snapshotRequest` buffers the request body and hands live +
+    queued copies independent readers (read errors preserved via `errReader`); `snapshotResponse`
+    clones struct/Header/Trailer/Request and buffers a 4097-byte body prefix (AsyncWrite's
+    ResponseChain 4096 cap +1 so oversize bodies trip the same partial-log path), live body
+    replays prefix then streams the remainder (`compositeBody` keeps the original closer).
+    `AsyncWrite`, on-disk formats, proxy.go, go.mod all untouched. 13 new tests in
+    `pkg/logger/logger_test.go` incl. ResponseChain parity (locks the +1 boundary:
+    `x-nuclei-ignore-error` marker at >4096, none at =4096) and live/snapshot error propagation.
+    RootCauseAnalysis confirmed the fix kills all four race branches (request dump, response
+    chain fill, post-enqueue `resp.Close` mutation, consumer-side ReadAlls). Forge review:
+    race eliminated; its two test gaps closed same-run.
+  - ⚠️ **KNOWN TRADEOFF (deferred to P15/logging rework):** snapshotting is synchronous in the
+    modifier hooks — full request-body buffer before forwarding (parity with the old async
+    `DumpRequest(req,true)` memory profile, but now blocks until the client body is read) and
+    up to 4097 response bytes buffered before client delivery (delays first byte on slow
+    streaming responses; note the old code *corrupted* streams instead — the async chain
+    drained/closed the live body mid-delivery). Revisit when P15 reworks logger ownership.
