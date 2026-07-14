@@ -1,0 +1,26 @@
+# mitmproxy-go Migration — Proxify Phase 7: Candidate Adapter and Serving Switch
+
+**Repository:** Proxify (this working directory). Authoritative spec:
+`planning/mitmproxy-go-migration/plan.md` Steps P9–P10. Requires the fork pinned (P8), and
+P3/P4/P7 complete. The old Martian core stays compile-tested until P17.
+
+- [ ] **P9 — Build and directly test the candidate adapter (depends on P3, P4, P7, P8).** New
+  `mitmproxy_adapter.go` defines private `mitmproxyAdapter` (fork handler, `*Proxy`, and a
+  `sync.Map` of CONNECT `FlowContext`s) with private methods `ServeHTTP`, `ServeSOCKS5`,
+  `Cleanup`.
+  - `newMitmproxyAdapter(p *Proxy, rt http.RoundTripper) (*mitmproxyAdapter, error)` supplies cert paths via `certs.CACertPath(p.options.Directory)` / `certs.CAKeyPath(p.options.Directory)` (P3 accessors; `options.Directory` is already populated from the runner's ConfigDir), exact requested cache size (`p.options.CertCacheSize`, default 256), `WithContextDialer` fastdialer adapter, `WithPassthroughFunc` using `util.MatchAnyRegex` over `p.options.PassThrough`, `WithLazyUpstreamMITM`, `WithRoundTripper`, the HTTP interceptor, and the lifecycle hook (`WithConnectionLifecycleHook`). The fork enables HTTP/2 by default (semantic H2 is the primary migration outcome), so do NOT pass `WithDisableHTTP2` — there is no explicit enable option; H2 is on unless disabled.
+  - Precondition: the CA cert/key files must already exist at `options.Directory`; return a descriptive error if either path is missing rather than letting the fork fail opaquely at first handshake.
+  - HTTP interceptor: obtain `ConnectionIDFromContext`; create a fresh UUID flow per request/stream with `IsSecure` from URL/TLS; call `p.interceptHTTP`. Lifecycle hook: create the CONNECT flow on received, pass the synthetic CONNECT request + selected response through callbacks/logging EXACTLY ONCE, record passthrough/error, delete on closed. Do NOT run the ordinary request DSL twice.
+  - Do Not Modify: `Proxy.Run`/`Stop`, Martian imports, the SOCKS listener, or README.
+  - Success: one H1 CONNECT logs/callbacks the CONNECT request + 200 once then the inner GET once; two concurrent H2 requests have different flow ids and the same connection id; a regex `.*\.opaque\.test:443` invokes the passthrough predicate with the full hostport; cache honors exact 1/256/257; direct adapter integration passes `-race` while old Martian E2E stays green. Full detail: plan.md §Step P9.
+
+- [ ] **P10 — Switch HTTP and SOCKS serving to the candidate (depends on P9).** `Proxy` owns
+  `adapter *mitmproxyAdapter`, `httpServer *http.Server`, HTTP/SOCKS `net.Listener`s, a
+  run context/cancel, a waitgroup, and one upstream `RoundTripper`.
+  - `NewProxy` builds the transport once, then the adapter, and does NOT create the old Martian core by default. Before building the adapter, ensure the CA exists for `options.Directory` by calling `certs.LoadCerts(options.Directory)` (idempotent) — today only `runner.NewRunner` calls it, so a direct library caller of `NewProxy` would otherwise pass the adapter cert paths that do not exist yet.
+  - The HTTP outer handler serves clear proxy-local requests before the adapter; all CONNECT and absolute-form proxy requests go to `adapter.ServeHTTP`. `Run` binds listeners synchronously so bind errors return; HTTP uses `http.Server.Serve`; the SOCKS accept loop calls `adapter.ServeSOCKS5` in tracked goroutines and handles temporary accept errors / context cancellation. Support HTTP-only, SOCKS-only, and combined configs; do NOT tunnel SOCKS through HTTP. `listenAddr` is set from the actual listener before requests (including `:0` tests). Keep old `setupHTTPProxy` and the Martian bridge compiling (removed in P17).
+  - Do Not Modify: the shutdown implementation beyond recording resources (P16 completes it).
+  - Success: HTTP-only and SOCKS-only GET `/hello` return 200; combined listeners process simultaneous requests; an occupied HTTP or SOCKS port makes `Run` return non-nil and closes the other listener; clear `http://proxify/cacert` bypasses the candidate transport; the candidate is the default serving core and the old core still compiles/tests. Full detail: plan.md §Step P10.
+
+- [ ] Run `go test ./...`, `go test -race ./...`, `go vet ./...`, `go build ./cmd/...`; all
+  clean before Proxify Phase 8.
