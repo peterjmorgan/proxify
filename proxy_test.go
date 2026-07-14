@@ -51,7 +51,25 @@ func startProxy(t *testing.T, mutate func(*Options)) (proxyURL string, caPool *x
 	t.Helper()
 
 	configDir = t.TempDir()
-	outputDir := filepath.Join(t.TempDir(), "logs")
+
+	// The logs dir gets its own temp root instead of t.TempDir(): the async
+	// file logger can write a log entry after the test returns (Stop is a
+	// no-op until P16), and a late write makes t.TempDir's RemoveAll fail the
+	// test with "directory not empty". Removal here is best-effort with
+	// retries; a leaked dir must not fail the test.
+	outputRoot, err := os.MkdirTemp("", "proxify-test-logs-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() {
+		for i := 0; i < 40; i++ {
+			if os.RemoveAll(outputRoot) == nil {
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	})
+	outputDir := filepath.Join(outputRoot, "logs")
 
 	if err := certs.LoadCerts(configDir); err != nil {
 		t.Fatalf("LoadCerts(%q): %v", configDir, err)
