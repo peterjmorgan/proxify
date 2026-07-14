@@ -14,14 +14,22 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macOS-latest]
+    env:
+      GOPRIVATE: github.com/peterjmorgan/*
     steps:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: 1.21.x
+          go-version: 1.26.5
 
       - name: Check out code
         uses: actions/checkout@v5
+
+      - name: Configure private module access
+        run: git config --global "url.https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/.insteadOf" "https://github.com/"
+
+      - name: Verify private module access
+        run: go mod download github.com/peterjmorgan/mitmproxy-go
 
       - name: Build
         run: go build .
