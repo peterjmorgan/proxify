@@ -13,3 +13,5 @@ dist/*
 **/proxify_logs.yaml
 /proxify
 **/proxify_logs
+# scratch checkout for mitmproxy-go fork work (not part of proxify)
+.mitmproxy-fork/

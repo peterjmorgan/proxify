@@ -2,16 +2,19 @@ package proxify
 
 // Transport construction for the proxy's upstream RoundTrippers (migration
 // plan Step P5+). The direct (no upstream proxy) standard transport is built
-// by newStandardTransport so it honors fastdialer policy and HTTP/2; the
-// upstream HTTP/SOCKS branches and the tls-client fingerprinting adapter are
-// relocated here verbatim and are reworked in later steps (P6/P7).
+// by newStandardTransport so it honors fastdialer policy and HTTP/2; upstream
+// HTTP/SOCKS routing is request-based via routedRoundTripper (Step P6); the
+// tls-client fingerprinting adapter is relocated here verbatim and reworked in
+// Step P7.
 
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
+	"sync"
 
 	fhttp "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
@@ -71,33 +74,167 @@ func (p *Proxy) getRoundTripper() (http.RoundTripper, error) {
 	return p.getStandardRoundTripper()
 }
 
-// getStandardRoundTripper returns the original http.Transport implementation
+// getStandardRoundTripper returns the upstream RoundTripper for non-fingerprint
+// mode. Upstream HTTP proxies take precedence over SOCKS5; when either is
+// configured a routedRoundTripper selects exactly one route per RoundTrip
+// (Step P6). With no upstream proxy it falls back to the direct P5 transport.
 func (p *Proxy) getStandardRoundTripper() (http.RoundTripper, error) {
-	roundtrip := newStandardTransport(p.Dialer)
-
 	if len(p.options.UpstreamHTTPProxies) > 0 {
-		roundtrip = &http.Transport{Proxy: func(req *http.Request) (*url.URL, error) {
-			return url.Parse(p.rbhttp.Next())
-		}, TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
-	} else if len(p.options.UpstreamSock5Proxies) > 0 {
-		// for each socks5 proxy create a dialer
-		socks5Dialers := make(map[string]proxy.Dialer)
-		for _, socks5proxy := range p.options.UpstreamSock5Proxies {
-			dialer, err := proxy.SOCKS5("tcp", socks5proxy, nil, proxy.Direct)
-			if err != nil {
-				return nil, err
-			}
-			socks5Dialers[socks5proxy] = dialer
-		}
-		roundtrip = &http.Transport{Dial: func(network, addr string) (net.Conn, error) {
-			// lookup next dialer
-			socks5Proxy := p.rbsocks5.Next()
-			socks5Dialer := socks5Dialers[socks5Proxy]
-			// use it to perform the request
-			return socks5Dialer.Dial(network, addr)
-		}, TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+		return p.newRoutedRoundTripper(p.options.UpstreamHTTPProxies, newHTTPProxyTransport)
 	}
-	return roundtrip, nil
+	if len(p.options.UpstreamSock5Proxies) > 0 {
+		return p.newRoutedRoundTripper(p.options.UpstreamSock5Proxies, newSOCKSProxyTransport)
+	}
+	return newStandardTransport(p.Dialer), nil
+}
+
+// routeSelector performs count-based round robin over a fixed list of upstream
+// routes. Unlike the previous roundrobin-inside-DialContext design, Next() is
+// called exactly once per RoundTrip, so a route stays stable across the retries
+// and concurrent dials of a single request. It advances to the next route
+// (modulo the route count) only after the current route has been handed out
+// rotateEvery times. Safe for concurrent use.
+type routeSelector struct {
+	mu          sync.Mutex
+	routes      []string
+	rotateEvery int
+	index       int
+	used        int
+}
+
+// newRouteSelector validates and builds a routeSelector. An empty route list or
+// a non-positive rotateEvery is rejected so misconfiguration fails at NewProxy
+// time rather than silently at the first request.
+func newRouteSelector(routes []string, rotateEvery int) (*routeSelector, error) {
+	if len(routes) == 0 {
+		return nil, fmt.Errorf("route selector: empty route list")
+	}
+	if rotateEvery <= 0 {
+		return nil, fmt.Errorf("route selector: rotateEvery must be > 0, got %d", rotateEvery)
+	}
+	return &routeSelector{
+		routes:      append([]string(nil), routes...),
+		rotateEvery: rotateEvery,
+	}, nil
+}
+
+// Next returns the current route, advancing to the next route after rotateEvery
+// selections.
+func (s *routeSelector) Next() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.used >= s.rotateEvery {
+		s.index = (s.index + 1) % len(s.routes)
+		s.used = 0
+	}
+	route := s.routes[s.index]
+	s.used++
+	return route
+}
+
+// routedRoundTripper selects one upstream route per RoundTrip (via routeSelector)
+// then delegates to that route's fixed http.RoundTripper. Because each route owns
+// its own transport, retries and concurrent dials within a single RoundTrip never
+// change route.
+type routedRoundTripper struct {
+	selector   *routeSelector
+	transports map[string]http.RoundTripper
+}
+
+// RoundTrip implements http.RoundTripper.
+func (rt *routedRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	route := rt.selector.Next()
+	return rt.transports[route].RoundTrip(req)
+}
+
+// CloseIdleConnections releases idle connections on every route transport.
+func (rt *routedRoundTripper) CloseIdleConnections() {
+	for _, t := range rt.transports {
+		closeIdleRoundTripper(t)
+	}
+}
+
+// newRoutedRoundTripper builds a routedRoundTripper: one fixed transport per
+// distinct route (built by build) plus a routeSelector that picks one route per
+// RoundTrip. Route order and rotateEvery drive the selection sequence.
+func (p *Proxy) newRoutedRoundTripper(routes []string, build func(*fastdialer.Dialer, string) (*http.Transport, error)) (http.RoundTripper, error) {
+	selector, err := newRouteSelector(routes, p.options.UpstreamProxyRequestsNumber)
+	if err != nil {
+		return nil, err
+	}
+	transports := make(map[string]http.RoundTripper, len(routes))
+	for _, route := range routes {
+		if _, ok := transports[route]; ok {
+			continue
+		}
+		t, err := build(p.Dialer, route)
+		if err != nil {
+			return nil, err
+		}
+		transports[route] = t
+	}
+	return &routedRoundTripper{selector: selector, transports: transports}, nil
+}
+
+// newHTTPProxyTransport builds a fixed-route http.Transport that forwards every
+// request through proxyURL, dialing the proxy itself through fastdialer. It
+// copies P5's direct-transport TLS/H2/pooling settings.
+func newHTTPProxyTransport(dialer *fastdialer.Dialer, proxyURL string) (*http.Transport, error) {
+	u, err := url.Parse(proxyURL)
+	if err != nil {
+		return nil, errorutil.NewWithErr(err).Msgf("invalid upstream HTTP proxy %q", proxyURL)
+	}
+	t := newStandardTransport(dialer)
+	t.Proxy = http.ProxyURL(u)
+	return t, nil
+}
+
+// newSOCKSProxyTransport builds a fixed-route http.Transport that tunnels every
+// dial through the SOCKS5 proxy at proxyURL. The forward dial to the proxy goes
+// through fastdialer, and the SOCKS dial is context-aware so request
+// cancellation propagates. It copies P5's TLS/H2/pooling settings.
+func newSOCKSProxyTransport(dialer *fastdialer.Dialer, proxyURL string) (*http.Transport, error) {
+	socksDialer, err := proxy.SOCKS5("tcp", socksProxyAddress(proxyURL), nil, &fastdialerForward{dialer: dialer})
+	if err != nil {
+		return nil, errorutil.NewWithErr(err).Msgf("invalid upstream SOCKS5 proxy %q", proxyURL)
+	}
+	t := newStandardTransport(dialer)
+	t.Proxy = nil
+	if cd, ok := socksDialer.(proxy.ContextDialer); ok {
+		t.DialContext = cd.DialContext
+	} else {
+		t.DialContext = func(_ context.Context, network, addr string) (net.Conn, error) {
+			return socksDialer.Dial(network, addr)
+		}
+	}
+	return t, nil
+}
+
+// socksProxyAddress reduces an upstream SOCKS5 proxy value to the host:port the
+// SOCKS dialer needs, tolerating both bare host:port and scheme-qualified
+// (socks5://host:port) forms.
+func socksProxyAddress(raw string) string {
+	if u, err := url.Parse(raw); err == nil && u.Host != "" {
+		return u.Host
+	}
+	return raw
+}
+
+// fastdialerForward adapts a fastdialer.Dialer to proxy.Dialer/ContextDialer so
+// x/net/proxy uses it as the forward dialer when connecting to a SOCKS5 proxy —
+// keeping fastdialer's allow/deny/DNS policy on the proxy socket.
+type fastdialerForward struct {
+	dialer *fastdialer.Dialer
+}
+
+// Dial implements proxy.Dialer.
+func (f *fastdialerForward) Dial(network, addr string) (net.Conn, error) {
+	return f.dialer.Dial(context.Background(), network, addr)
+}
+
+// DialContext implements proxy.ContextDialer.
+func (f *fastdialerForward) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	return f.dialer.Dial(ctx, network, addr)
 }
 
 // getTLSClientRoundTripper returns a bogdanfinn/tls-client RoundTripper with fingerprinting
