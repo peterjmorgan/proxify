@@ -226,7 +226,11 @@ func isSecureRequest(req *http.Request) bool {
 // syntheticConnectRequest fabricates the CONNECT request Proxify's request
 // policy logs for a tunnel. The fork does not surface a request object on
 // CONNECT lifecycle events, so the adapter builds one from the target
-// host:port with a non-nil header and no body.
+// host:port with a non-nil header and an empty (but non-nil) body. The body is
+// http.NoBody, not nil: the default policy path reads req.Body when a request
+// DSL is configured (util.HTTPRequestToMap) and closes it during
+// match-replace (MatchReplaceRequest), both of which nil-panic on a CONNECT
+// otherwise.
 func syntheticConnectRequest(hostport string) *http.Request {
 	return &http.Request{
 		Method:     http.MethodConnect,
@@ -236,6 +240,7 @@ func syntheticConnectRequest(hostport string) *http.Request {
 		ProtoMajor: 1,
 		ProtoMinor: 1,
 		Header:     make(http.Header),
+		Body:       http.NoBody,
 	}
 }
 

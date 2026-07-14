@@ -304,7 +304,19 @@ func (p *Proxy) MatchReplaceRequest(req *http.Request) error {
 	req.Method = requestNew.Method
 	req.Header = requestNew.Header
 	req.Body = requestNew.Body
+	// http.ReadRequest reconstructs URL from the request-line target, which for
+	// origin-form requests (MITM'd HTTPS and clear proxied HTTP alike) carries
+	// no scheme/host. The candidate transport routes off req.URL, so preserve
+	// the scheme/host the rewrite did not explicitly set; an absolute-form
+	// rewrite that supplies its own still wins.
+	scheme, host := req.URL.Scheme, req.URL.Host
 	req.URL = requestNew.URL
+	if req.URL.Scheme == "" {
+		req.URL.Scheme = scheme
+	}
+	if req.URL.Host == "" {
+		req.URL.Host = host
+	}
 	return nil
 }
 

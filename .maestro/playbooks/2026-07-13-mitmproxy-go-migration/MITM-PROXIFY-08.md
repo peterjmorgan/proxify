@@ -6,13 +6,37 @@ listeners. These are mostly test-only tasks (extend root E2E); make production c
 observed regressions. Every network test binds `127.0.0.1:0` with bounded contexts/channels —
 no `time.Sleep` as the sole synchronization.
 
-- [ ] **P11 — Policy compatibility (depends on P10).** Extend root E2E to cover HTTP and HTTPS
+- [x] **P11 — Policy compatibility (depends on P10).** Extend root E2E to cover HTTP and HTTPS
   request DSL, response DSL, request/response match-replace, callback `Set`/`Get`, logger
   export, CONNECT request/response visibility, proxify static root and `/cacert`, and regex
   passthrough. CONNECT must have one flow id, the inner request a different flow id, both sharing
   the connection id; passthrough carries bytes opaquely and produces NO inner HTTP callback/log
   entry. Do Not Modify: logger on-disk schema, DSL library, transports, shutdown. Success: all
   listed cases pass under `-race`. Full detail: plan.md §Step P11.
+
+  **Done (2026-07-13):** Added `proxy_compat_test.go` with 8 E2E tests over the candidate serving
+  core (`Proxy.Run`): `TestCompatDSLMatchExport` (http+https subtests: request+response DSL drive
+  a `.match` logger export), `TestCompatMatchReplace` (request `X-Old: old`→`new` header and
+  response `old`→`new` body, client-visible over MITM), `TestCompatConnectVisibleInLoggerExport`
+  (exactly one CONNECT export entry with 200 + separate inner GET), `TestCompatConnectAndInnerFlowIDs`
+  (distinct flow ids, shared connection id), `TestCompatStaticRoot` (banner page), and two
+  passthrough tests proving opaque h2 with the origin cert and **zero** inner callback/log entries.
+  `/cacert` and callback `Set`/`Get` remain covered by existing `TestCharacterizeCacert` and
+  `TestCharacterizeFlowContextSharedAcrossCallbacks`. On-disk assertions poll with a deadline
+  (async logger + no-op Stop until P16).
+
+  **Two observed regressions fixed (allowed by "production changes only for observed regressions";
+  neither touches the Do-Not-Modify list):**
+  1. `syntheticConnectRequest` (mitmproxy_adapter.go) had a nil `Body`, so every CONNECT panicked
+     when a request DSL (`util.HTTPRequestToMap` reads `req.Body`) or request match-replace
+     (`MatchReplaceRequest` closes `req.Body`) was configured while intercepting HTTPS. Fixed by
+     using `http.NoBody`, mirroring `syntheticConnectResponse`.
+  2. `MatchReplaceRequest` (proxy.go) rebuilt the request via `http.ReadRequest`, which drops the
+     URL scheme/host for origin-form requests; the candidate transport routes off `req.URL`, so
+     match-replace broke routing (EOF). Fixed by preserving the pre-rewrite scheme/host when the
+     rewrite did not supply its own.
+
+  Verified: `go test -race .` and `go vet ./...` clean.
 
 - [ ] **P12 — HTTP/1 and HTTP/2 protocol matrix (depends on P10).** Add table-driven
   `TestProtocolMatrix` for H1→H1, H1→H2 TLS, H2→H2, H2→H1 TLS, asserting downstream callback
