@@ -3,6 +3,7 @@ package proxify
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/haxii/fastproxy/bufiopool"
 	"github.com/haxii/fastproxy/superproxy"
@@ -26,7 +28,6 @@ import (
 	"github.com/projectdiscovery/proxify/pkg/logger/elastic"
 	"github.com/projectdiscovery/proxify/pkg/logger/kafka"
 	"github.com/projectdiscovery/proxify/pkg/types"
-	"github.com/projectdiscovery/proxify/pkg/util"
 	rbtransport "github.com/projectdiscovery/roundrobin/transport"
 	"github.com/projectdiscovery/tinydns"
 	errorutil "github.com/projectdiscovery/utils/errors"
@@ -86,6 +87,20 @@ type Proxy struct {
 	rbsocks5     *rbtransport.RoundTransport
 	proxifyMux   *http.ServeMux // serve banner page and static files
 	listenAddr   string
+
+	// Candidate serving core (migration plan Step P10). adapter is the default
+	// serving engine (mitmproxy-go fork); transport is the single owned upstream
+	// RoundTripper it dials origins through. httpServer, httpListener, and
+	// socksListener plus the run context/cancel and waitgroup are the serving
+	// resources Run owns and Stop will release once P16 completes shutdown.
+	adapter       *mitmproxyAdapter
+	transport     http.RoundTripper
+	httpServer    *http.Server
+	httpListener  net.Listener
+	socksListener net.Listener
+	runCtx        context.Context
+	runCancel     context.CancelFunc
+	wg            sync.WaitGroup
 }
 
 func NewProxy(options *Options) (*Proxy, error) {
@@ -173,25 +188,30 @@ func NewProxy(options *Options) (*Proxy, error) {
 		proxifyMux: pmux,
 	}
 
-	if err := proxy.setupHTTPProxy(); err != nil {
+	// Candidate serving core (Step P10): build the single upstream transport
+	// once, then the adapter over it. The old Martian core (setupHTTPProxy) and
+	// the legacy SOCKS-through-HTTP tunnel (setupLegacySOCKSProxy) are
+	// intentionally NOT built by default; they stay compiling for baseline
+	// coverage until P17 removes them.
+	transport, err := proxy.getRoundTripper()
+	if err != nil {
+		return nil, errorutil.NewWithErr(err).Msgf("failed to setup transport")
+	}
+	proxy.transport = transport
+
+	// The adapter needs the CA cert/key files on disk. runner.NewRunner already
+	// calls LoadCerts, but a direct library caller of NewProxy may not; call it
+	// here (idempotent: loads existing files or generates them) so the adapter
+	// never receives cert paths that do not exist yet.
+	if err := certs.LoadCerts(options.Directory); err != nil {
+		return nil, errorutil.NewWithErr(err).Msgf("failed to load CA certificates from %s", options.Directory)
+	}
+
+	adapter, err := newMitmproxyAdapter(proxy, transport)
+	if err != nil {
 		return nil, err
 	}
-
-	var socks5proxy *socks5.Server
-	if options.ListenAddrSocks5 != "" {
-		if options.Verbosity <= types.VerbositySilent {
-			socks5proxy = socks5.NewServer(
-				socks5.WithLogger(socks5.NewLogger(log.New(io.Discard, "", log.Ltime|log.Lshortfile))),
-				socks5.WithDial(proxy.httpTunnelDialer),
-			)
-		} else {
-			socks5proxy = socks5.NewServer(
-				socks5.WithDial(proxy.httpTunnelDialer),
-			)
-		}
-	}
-
-	proxy.socks5proxy = socks5proxy
+	proxy.adapter = adapter
 
 	return proxy, nil
 }
@@ -333,72 +353,163 @@ func (p *Proxy) MatchReplaceResponse(resp *http.Response) error {
 	return nil
 }
 
+// Run serves the candidate adapter over the configured HTTP and/or SOCKS5
+// listeners (migration plan Step P10). Listeners are bound synchronously so a
+// bind failure (e.g. an occupied port) returns an error before any serving
+// goroutine starts; if one of two configured listeners fails to bind, the
+// already-bound one is closed so no half-started server is left running. HTTP is
+// served via http.Server.Serve; SOCKS5 connections are accepted in a tracked
+// loop and each handed to adapter.ServeSOCKS5. HTTP-only, SOCKS-only, and
+// combined configurations are all supported; SOCKS is served directly by the
+// adapter and never tunneled through the HTTP proxy.
 func (p *Proxy) Run() error {
-	var wg sync.WaitGroup
+	ctx, cancel := context.WithCancel(context.Background())
+	p.runCtx = ctx
+	p.runCancel = cancel
 
 	if p.tinydns != nil {
-		wg.Add(1)
+		p.wg.Add(1)
 		go func() {
-			defer wg.Done()
+			defer p.wg.Done()
 			if err := p.tinydns.Run(); err != nil {
 				gologger.Warning().Msgf("Could not start dns server: %s\n", err)
 			}
 		}()
 	}
 
-	// http proxy
-	if p.httpProxy != nil {
-		p.httpProxy.TLSPassthroughFunc = func(req *http.Request) bool {
-			// Skip MITM for hosts that are in pass-through list
-			return util.MatchAnyRegex(p.options.PassThrough, req.Host)
-		}
-
-		p.httpProxy.SetRequestModifier(p)
-		p.httpProxy.SetResponseModifier(p)
-
+	// Bind listeners synchronously so bind errors surface from Run. If the SOCKS
+	// bind fails after the HTTP listener is up, close the HTTP listener so the
+	// caller is not left with a half-started server (and vice versa is moot: the
+	// HTTP listener binds first, so no SOCKS listener exists yet if it fails).
+	if p.options.ListenAddrHTTP != "" {
 		l, err := net.Listen("tcp", p.options.ListenAddrHTTP)
 		if err != nil {
-			gologger.Fatal().Msgf("failed to setup listener got %v", err)
+			cancel()
+			return errorutil.NewWithErr(err).Msgf("failed to bind HTTP listener on %s", p.options.ListenAddrHTTP)
 		}
+		p.httpListener = l
+		// Record the actual bound address before any request is served, so
+		// isProxyLocal recognizes proxy-local hosts even with a :0 test port.
 		p.listenAddr = l.Addr().String()
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			gologger.Fatal().Msgf("%v", p.httpProxy.Serve(l))
-		}()
 	}
-
-	// socks5 proxy
-	if p.socks5proxy != nil {
-		if p.httpProxy != nil {
-			httpProxyIP, httpProxyPort, err := net.SplitHostPort(p.options.ListenAddrHTTP)
-			if err != nil {
-				return err
+	if p.options.ListenAddrSocks5 != "" {
+		l, err := net.Listen("tcp", p.options.ListenAddrSocks5)
+		if err != nil {
+			cancel()
+			if p.httpListener != nil {
+				_ = p.httpListener.Close()
 			}
-			httpProxyPortUint, err := strconv.ParseUint(httpProxyPort, 10, 16)
-			if err != nil {
-				return err
-			}
-			p.socks5tunnel, err = superproxy.NewSuperProxy(httpProxyIP, uint16(httpProxyPortUint), superproxy.ProxyTypeHTTP, "", "", "")
-			if err != nil {
-				return err
-			}
-			p.bufioPool = bufiopool.New(4096, 4096)
+			return errorutil.NewWithErr(err).Msgf("failed to bind SOCKS5 listener on %s", p.options.ListenAddrSocks5)
 		}
+		p.socksListener = l
+	}
 
-		wg.Add(1)
+	if p.httpListener != nil {
+		p.httpServer = &http.Server{
+			Handler:     p.outerHTTPHandler(),
+			BaseContext: func(net.Listener) context.Context { return ctx },
+		}
+		p.wg.Add(1)
 		go func() {
-			defer wg.Done()
-
-			gologger.Fatal().Msgf("%v", p.socks5proxy.ListenAndServe("tcp", p.options.ListenAddrSocks5))
+			defer p.wg.Done()
+			if err := p.httpServer.Serve(p.httpListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				gologger.Warning().Msgf("HTTP proxy server stopped: %v", err)
+			}
 		}()
 	}
 
-	wg.Wait()
+	if p.socksListener != nil {
+		p.wg.Add(1)
+		go func() {
+			defer p.wg.Done()
+			p.serveSOCKS(ctx, p.socksListener)
+		}()
+	}
+
+	p.wg.Wait()
 	return nil
 }
 
+// outerHTTPHandler is the front handler for the HTTP listener. Clear
+// proxy-local requests (the banner page and /cacert) are served directly from
+// the local mux, bypassing the candidate transport; every CONNECT and
+// absolute-form proxy request is handed to the candidate adapter.
+func (p *Proxy) outerHTTPHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect && p.isProxyLocal(r.Host) {
+			p.proxifyMux.ServeHTTP(w, r)
+			return
+		}
+		p.adapter.ServeHTTP(w, r)
+	})
+}
+
+// serveSOCKS accepts SOCKS5 connections on l and hands each to the candidate
+// adapter in a tracked goroutine. It returns cleanly on context cancellation or
+// a closed listener; other accept errors are tolerated with a short backoff so a
+// transient failure does not tear down the loop or spin.
+func (p *Proxy) serveSOCKS(ctx context.Context, l net.Listener) {
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			gologger.Warning().Msgf("SOCKS5 accept error: %v", err)
+			time.Sleep(5 * time.Millisecond)
+			continue
+		}
+		p.wg.Add(1)
+		go func() {
+			defer p.wg.Done()
+			if err := p.adapter.ServeSOCKS5(ctx, conn); err != nil {
+				gologger.Debug().Msgf("SOCKS5 serve: %v", err)
+			}
+		}()
+	}
+}
+
 func (p *Proxy) Stop() {}
+
+// setupLegacySOCKSProxy builds the pre-migration go-socks5 server that tunneled
+// SOCKS through the Martian HTTP proxy. Run no longer calls it — the candidate
+// adapter serves SOCKS directly and does not tunnel through HTTP — but it is
+// retained (with the superproxy/bufiopool tunnel wiring) for compile coverage
+// until P17 removes the Martian bridge.
+func (p *Proxy) setupLegacySOCKSProxy() error {
+	if p.options.ListenAddrSocks5 == "" {
+		return nil
+	}
+	var socks5proxy *socks5.Server
+	if p.options.Verbosity <= types.VerbositySilent {
+		socks5proxy = socks5.NewServer(
+			socks5.WithLogger(socks5.NewLogger(log.New(io.Discard, "", log.Ltime|log.Lshortfile))),
+			socks5.WithDial(p.httpTunnelDialer),
+		)
+	} else {
+		socks5proxy = socks5.NewServer(
+			socks5.WithDial(p.httpTunnelDialer),
+		)
+	}
+	p.socks5proxy = socks5proxy
+
+	if p.httpProxy != nil {
+		httpProxyIP, httpProxyPort, err := net.SplitHostPort(p.options.ListenAddrHTTP)
+		if err != nil {
+			return err
+		}
+		httpProxyPortUint, err := strconv.ParseUint(httpProxyPort, 10, 16)
+		if err != nil {
+			return err
+		}
+		p.socks5tunnel, err = superproxy.NewSuperProxy(httpProxyIP, uint16(httpProxyPortUint), superproxy.ProxyTypeHTTP, "", "", "")
+		if err != nil {
+			return err
+		}
+		p.bufioPool = bufiopool.New(4096, 4096)
+	}
+	return nil
+}
 
 // setupHTTPProxy configures proxy with settings
 func (p *Proxy) setupHTTPProxy() error {

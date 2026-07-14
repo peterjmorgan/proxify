@@ -79,26 +79,13 @@ func serveAdapter(t *testing.T, p *Proxy) (proxyURL string, caPool *x509.CertPoo
 
 // TestAdapterMissingCAReturnsError: newMitmproxyAdapter fails with a descriptive
 // error when the CA cert/key files are absent, rather than deferring to an
-// opaque fork handshake failure.
+// opaque fork handshake failure. Since P10, NewProxy always ensures its own CA
+// exists, so the missing-CA case is exercised by pointing an otherwise-valid
+// proxy's adapter at an empty directory.
 func TestAdapterMissingCAReturnsError(t *testing.T) {
-	// Load a CA elsewhere so NewProxy's Martian core has a usable global CA,
-	// then point the adapter at an empty directory with no CA files.
-	if err := certs.LoadCerts(t.TempDir()); err != nil {
-		t.Fatalf("LoadCerts: %v", err)
-	}
-	emptyDir := t.TempDir() // deliberately no CA files
-	opts := &Options{
-		Directory:     emptyDir,
-		CertCacheSize: 256,
-		Verbosity:     types.VerbositySilent,
-		Elastic:       &elastic.Options{},
-		Kafka:         &kafka.Options{},
-	}
-	p, err := NewProxy(opts)
-	if err != nil {
-		t.Fatalf("NewProxy: %v", err)
-	}
-	_, err = newMitmproxyAdapter(p, newStandardTransport(p.Dialer))
+	p := newAdapterProxy(t, nil)
+	p.options.Directory = t.TempDir() // deliberately no CA files
+	_, err := newMitmproxyAdapter(p, newStandardTransport(p.Dialer))
 	if err == nil {
 		t.Fatal("expected error when CA files are missing, got nil")
 	}
@@ -338,7 +325,12 @@ func TestCacheCapacityHonorsExactAndDefault(t *testing.T) {
 // this test will fail then and must be updated to expect success.
 func TestAdapterCacheCapacityForkContract(t *testing.T) {
 	newAt := func(size int) error {
-		p := newAdapterProxy(t, func(o *Options) { o.CertCacheSize = size })
+		// Build a valid proxy first (NewProxy builds the adapter with the default
+		// 256 capacity), then re-build the adapter directly at the target
+		// capacity so the fork guard — not NewProxy's eager build — is what this
+		// test characterizes.
+		p := newAdapterProxy(t, nil)
+		p.options.CertCacheSize = size
 		_, err := newMitmproxyAdapter(p, newStandardTransport(p.Dialer))
 		return err
 	}
