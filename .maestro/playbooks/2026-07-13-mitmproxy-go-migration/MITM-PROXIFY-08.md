@@ -172,6 +172,26 @@ no `time.Sleep` as the sole synchronization.
   fork-blocked tests skipped. Left `- [ ]` because the successful-relay and teardown scenarios
   (spec's scenarios 15–16) do not yet pass.
 
+  **Re-verified still blocked (2026-07-14, later run) — no change; independently reconfirmed the
+  fork dependency has not advanced:**
+  - Fork still pinned `github.com/peterjmorgan/mitmproxy-go v1.2.0` in `go.mod` (no `replace`
+    directive; no fork tag newer than v1.2.0 in the module cache).
+  - Defect still present in the pinned source: `mitm.go:1270` `var dstConn net.Conn = connCtx.remote`
+    (typed-nil-wrapping interface under lazy MITM) and `mitm.go:1856` `if upstream == nil` reads
+    false → skips the lazy dial → nil write panic. Exact same root cause.
+  - Fork task **F7** (`MITM-FORK-02.md`, "successful `ping`→`pong` relays in eager and lazy modes")
+    is still **unchecked**, and its publish step `MITM-FORK-03.md` has not run.
+  - Current test state reconfirmed: `TestListenerSharedPolicy` + `TestWebSocketCallbackRejectionNeverReachesOrigin`
+    **PASS**; `TestWebSocketInterception` + `TestWebSocketRelayTeardownOnClientClose` **SKIP**.
+
+  **Unblock sequence (owned by the fork track, not Proxify):** fork completes F5 → F6 → **F7**
+  (patch `relayConnForWS` to treat an un-dialed remote as needing a lazy dial), publishes via
+  `MITM-FORK-03.md` (re-tag), then Proxify re-pins the new fork version in `go.mod`. Only then do
+  the two `t.Skip`'d tests flip active and P14 can be checked. No Proxify-side action can complete
+  P14 before that.
+
+<!-- maestro:halt: P14 hard-blocked on fork track — fork F7 (successful lazy-mode WS relay) not yet implemented; fork still pinned v1.2.0 with the mitm.go:1270/:1856 typed-nil panic. Proxify track cannot proceed: the only remaining task is the "all clean before Phase 9" gate, which would falsely pass (2 WS tests skipped) and wave Phase 9 through on an unverified Phase 8. Resume: complete fork F5→F6→F7, publish (MITM-FORK-03), re-pin the fork in go.mod, then delete this marker. -->
+
 - [x] **P15 — Make logger shutdown drain safely (depends on P11).** In `pkg/logger/logger.go`
   add a producer/close mutex, `closeOnce`, and a worker `WaitGroup`. `LogRequest`/`LogResponse`
   either enqueue while open or return a new package error `ErrLoggerClosed`. `Close` marks closed
