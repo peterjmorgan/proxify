@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/asaskevich/govalidator"
@@ -28,6 +29,11 @@ const (
 	dataWithoutNewLine   = "%s"
 	LoggerConfigFilename = "export-config.yaml"
 )
+
+// ErrLoggerClosed is returned by LogRequest/LogResponse when they are called
+// after Close has begun: the async queue is (or is about to be) closed, so the
+// transaction is rejected rather than lost or sent on a closed channel.
+var ErrLoggerClosed = errors.New("logger is closed")
 
 type OptionsLogger struct {
 	Verbosity    types.Verbosity
@@ -50,6 +56,13 @@ type Logger struct {
 	asyncqueue chan types.HTTPTransaction
 	Store      []Store
 	sWriter    OutputFileWriter // sWriter is the structured writer
+
+	// mu excludes producers only across the send/closed decision (RLock) and
+	// the close transition (Lock). It is never held while draining.
+	mu        sync.RWMutex
+	closed    bool
+	closeOnce sync.Once      // closes asyncqueue and sWriter exactly once
+	wg        sync.WaitGroup // tracks the AsyncWrite worker so Close can drain
 }
 
 // NewLogger instance
@@ -98,8 +111,23 @@ func NewLogger(options *OptionsLogger) *Logger {
 		}
 	}
 
+	logger.wg.Add(1)
 	go logger.AsyncWrite()
 	return logger
+}
+
+// enqueue snapshots have already been taken by the caller; it hands the
+// transaction to the async writer while holding the producer lock only across
+// the closed check and the channel send, so Close can never close the queue
+// out from under an in-flight send.
+func (l *Logger) enqueue(t types.HTTPTransaction) error {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if l.closed {
+		return ErrLoggerClosed
+	}
+	l.asyncqueue <- t
+	return nil
 }
 
 // LogRequest and user data
@@ -110,11 +138,10 @@ func (l *Logger) LogRequest(req *http.Request, userdata types.UserData) error {
 
 	// Snapshot while this goroutine still has exclusive access: the async
 	// writer must never touch the live request the proxy is about to forward.
-	l.asyncqueue <- types.HTTPTransaction{
+	return l.enqueue(types.HTTPTransaction{
 		Userdata: userdata,
 		Request:  snapshotRequest(req),
-	}
-	return nil
+	})
 }
 
 // LogResponse and user data
@@ -126,12 +153,11 @@ func (l *Logger) LogResponse(resp *http.Response, userdata types.UserData) error
 	// writer must never touch the live response the proxy is still writing
 	// to the client, nor fields callers mutate after logging (resp.Close).
 	snapshot := snapshotResponse(resp)
-	l.asyncqueue <- types.HTTPTransaction{
+	return l.enqueue(types.HTTPTransaction{
 		Userdata: userdata,
 		Response: snapshot,
 		Request:  snapshot.Request,
-	}
-	return nil
+	})
 }
 
 // responseSnapshotPrefix is how much of a response body is buffered into a
@@ -223,6 +249,7 @@ func snapshotResponse(resp *http.Response) *http.Response {
 
 // AsyncWrite data
 func (l *Logger) AsyncWrite() {
+	defer l.wg.Done()
 	for httpData := range l.asyncqueue {
 		if httpData.Request == nil {
 			// we can't do anything without request
@@ -313,12 +340,34 @@ func (l *Logger) AsyncWrite() {
 	}
 }
 
-// Close logger instance
+// Close stops the logger, drains every accepted transaction, then closes the
+// structured writer. It is safe to call concurrently and repeatedly: sync.Once
+// runs the shutdown once and every caller blocks until that single drain
+// completes. Producers must be stopped by the owner (P16) before or during
+// Close; any that race Close observe ErrLoggerClosed rather than a lost write.
 func (l *Logger) Close() {
-	if l.sWriter != nil {
-		_ = l.sWriter.Close()
-	}
-	close(l.asyncqueue)
+	l.closeOnce.Do(func() {
+		// Exclude producers just long enough to flip closed and close the
+		// queue. Taking the write lock waits for every in-flight enqueue to
+		// finish its send, so close never races a channel send; afterward any
+		// producer sees closed and returns ErrLoggerClosed.
+		l.mu.Lock()
+		l.closed = true
+		close(l.asyncqueue)
+		l.mu.Unlock()
+
+		// Drain outside the producer lock: wait for AsyncWrite to process
+		// every queued transaction so nothing accepted before Close is lost.
+		l.wg.Wait()
+
+		// The writer is closed only after the drain so AsyncWrite never writes
+		// to a closed writer.
+		if l.sWriter != nil {
+			if err := l.sWriter.Close(); err != nil {
+				gologger.Warning().Msgf("Error while closing structured writer: %s", err)
+			}
+		}
+	})
 }
 
 // debugLogRequest logs the request to the console if debugging is enabled

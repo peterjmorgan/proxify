@@ -3,11 +3,13 @@ package logger
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httputil"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -252,9 +254,10 @@ func TestSnapshotResponsePropagatesMidBodyError(t *testing.T) {
 }
 
 func TestLoggerEndToEndRaceFree(t *testing.T) {
-	// No output folder: Close does not drain AsyncWrite (P15), so disk writes
-	// would race the test's TempDir cleanup. The race surface under test is
-	// AsyncWrite consuming snapshots while live objects are used and mutated.
+	// No output folder: the file store is a no-op with empty OutputFolder/File,
+	// so even though Close now drains AsyncWrite (P15) nothing hits disk. The
+	// race surface under test is AsyncWrite consuming snapshots while live
+	// objects are used and mutated.
 	l := NewLogger(&OptionsLogger{
 		Verbosity: types.VerbosityDefault,
 		Elastic:   &elastic.Options{},
@@ -290,4 +293,140 @@ func TestLoggerEndToEndRaceFree(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	l.Close()
+}
+
+// recordingStore is a fake Store that records, in arrival order, the flow ID of
+// every transaction AsyncWrite hands it.
+type recordingStore struct {
+	mu  sync.Mutex
+	ids []string
+}
+
+func (s *recordingStore) Save(data types.HTTPTransaction) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ids = append(s.ids, data.Userdata.ID)
+	return nil
+}
+
+func (s *recordingStore) snapshot() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, len(s.ids))
+	copy(out, s.ids)
+	return out
+}
+
+// countingWriter is a fake OutputFileWriter that counts how many times Close was
+// called, so the "close once" invariant can be asserted.
+type countingWriter struct {
+	closes atomic.Int64
+}
+
+func (w *countingWriter) Write(*types.HTTPRequestResponseLog) error { return nil }
+func (w *countingWriter) Close() error {
+	w.closes.Add(1)
+	return nil
+}
+
+// newDrainTestLogger builds a Logger wired to the given store with no disk or
+// structured output, so tests exercise the drain path in isolation.
+func newDrainTestLogger(t *testing.T, store Store) *Logger {
+	t.Helper()
+	l := NewLogger(&OptionsLogger{
+		Verbosity: types.VerbosityDefault,
+		Elastic:   &elastic.Options{},
+		Kafka:     &kafka.Options{},
+	})
+	// Replace the default file store before enqueuing anything: the channel
+	// send below establishes happens-before with AsyncWrite's read of Store.
+	l.Store = []Store{store}
+	return l
+}
+
+// TestCloseDrainsAllAcceptedInOrder enqueues 100 numbered transactions and
+// asserts the fake Store received all of them, in order, by the time Close
+// returns (P15: no accepted item is dropped and the drain is synchronous).
+func TestCloseDrainsAllAcceptedInOrder(t *testing.T) {
+	store := &recordingStore{}
+	l := newDrainTestLogger(t, store)
+
+	const n = 100
+	want := make([]string, n)
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("%03d", i)
+		want[i] = id
+		req := newTestRequest(t, strings.NewReader("body"))
+		if err := l.LogRequest(req, types.UserData{ID: id, Host: "example.local"}); err != nil {
+			t.Fatalf("LogRequest %d: %v", i, err)
+		}
+	}
+
+	l.Close()
+
+	got := store.snapshot()
+	if len(got) != n {
+		t.Fatalf("store received %d transactions, want %d", len(got), n)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("out of order at %d: got %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	// Close after drain must still reject producers.
+	if err := l.LogRequest(newTestRequest(t, nil), types.UserData{ID: "late"}); !errors.Is(err, ErrLoggerClosed) {
+		t.Fatalf("LogRequest after Close = %v, want ErrLoggerClosed", err)
+	}
+}
+
+// TestConcurrentProducersRacingClose runs 20 producers against a concurrent
+// Close: every LogRequest must return nil or ErrLoggerClosed and never panic
+// on a send to a closed channel (run under -race).
+func TestConcurrentProducersRacingClose(t *testing.T) {
+	l := newDrainTestLogger(t, &recordingStore{})
+
+	const producers = 20
+	var wg sync.WaitGroup
+	wg.Add(producers)
+	for p := 0; p < producers; p++ {
+		go func(p int) {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				req := newTestRequest(t, strings.NewReader("body"))
+				err := l.LogRequest(req, types.UserData{ID: fmt.Sprintf("%d-%d", p, i)})
+				if err != nil && !errors.Is(err, ErrLoggerClosed) {
+					t.Errorf("producer %d: unexpected error %v", p, err)
+					return
+				}
+			}
+		}(p)
+	}
+
+	// Close concurrently with the producers so some sends race the close.
+	l.Close()
+	wg.Wait()
+}
+
+// TestRepeatedCloseIsIdempotent calls Close 20 times concurrently and asserts
+// every call returns and the structured writer is closed exactly once.
+func TestRepeatedCloseIsIdempotent(t *testing.T) {
+	writer := &countingWriter{}
+	l := newDrainTestLogger(t, &recordingStore{})
+	l.sWriter = writer
+
+	const callers = 20
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			defer wg.Done()
+			l.Close()
+		}()
+	}
+	wg.Wait()
+
+	if got := writer.closes.Load(); got != 1 {
+		t.Fatalf("structured writer closed %d times, want 1", got)
+	}
 }

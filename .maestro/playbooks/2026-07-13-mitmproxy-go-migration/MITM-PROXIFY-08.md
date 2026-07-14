@@ -172,7 +172,7 @@ no `time.Sleep` as the sole synchronization.
   fork-blocked tests skipped. Left `- [ ]` because the successful-relay and teardown scenarios
   (spec's scenarios 15–16) do not yet pass.
 
-- [ ] **P15 — Make logger shutdown drain safely (depends on P11).** In `pkg/logger/logger.go`
+- [x] **P15 — Make logger shutdown drain safely (depends on P11).** In `pkg/logger/logger.go`
   add a producer/close mutex, `closeOnce`, and a worker `WaitGroup`. `LogRequest`/`LogResponse`
   either enqueue while open or return a new package error `ErrLoggerClosed`. `Close` marks closed
   while excluding producers, closes `asyncqueue` exactly once, waits for `AsyncWrite` to drain,
@@ -183,6 +183,33 @@ no `time.Sleep` as the sole synchronization.
   transactions all reach a fake `Store` in order before `Close` returns; 20 concurrent producers
   racing `Close` return nil or `ErrLoggerClosed` and never panic; 20 repeated `Close` calls all
   return; `go test -race ./pkg/logger/...` passes. Full detail: plan.md §Step P15.
+
+  **Done (2026-07-14):** Reworked `pkg/logger/logger.go` for a safe, idempotent, draining shutdown:
+  - Added `ErrLoggerClosed` (only new API artifact) and four fields to `Logger`: `mu sync.RWMutex`
+    (producer/close exclusion), `closed bool`, `closeOnce sync.Once`, `wg sync.WaitGroup`.
+  - `NewLogger` now does `wg.Add(1)` before `go AsyncWrite()`; `AsyncWrite` does `defer wg.Done()`.
+  - New `enqueue` helper takes `mu.RLock`, returns `ErrLoggerClosed` if closed, else sends — the
+    lock is held **only** across the closed-check + channel send, never during snapshotting or
+    draining. `LogRequest`/`LogResponse` snapshot first (unchanged, keeps exclusive live-object
+    access), then call `enqueue`; both retain their signatures.
+  - `Close` wraps the shutdown in `closeOnce.Do`: takes `mu.Lock` (waits for in-flight sends to
+    finish), flips `closed=true`, `close(asyncqueue)`, unlocks, then `wg.Wait()` drains the worker
+    **outside** the lock, then closes `sWriter` once (writer close moved *after* the drain so
+    AsyncWrite never writes to a closed writer — the old code closed it first). `sync.Once` makes
+    concurrent/repeated `Close` all block until the single drain completes; signature unchanged.
+  - Preserved: 1000-slot queue, FIFO ordering (single consumer), `Store`/format/`MaxSize` behavior,
+    Elastic/Kafka/file stores, serialization schema — none touched.
+
+  Tests added to `pkg/logger/logger_test.go` (fakes: `recordingStore`, `countingWriter`,
+  `newDrainTestLogger` helper): `TestCloseDrainsAllAcceptedInOrder` (100 numbered txns all reach
+  the store in order before `Close` returns, and a post-Close `LogRequest` returns `ErrLoggerClosed`),
+  `TestConcurrentProducersRacingClose` (20×50 producers racing `Close` — only nil/`ErrLoggerClosed`,
+  no send-on-closed panic), `TestRepeatedCloseIsIdempotent` (20 concurrent `Close` calls; structured
+  writer closed exactly once). Updated the now-stale P15 comment in `TestLoggerEndToEndRaceFree`
+  (file store is a no-op on empty folder, so the new drain writes nothing to disk).
+
+  Verified: `go test -race ./pkg/logger/...` passes; regression-checked the shared change with
+  `go test -race .` (root E2E, 9.8s) and `go build ./...` + `go vet ./...` — all clean.
 
 - [ ] Run `go test ./...`, `go test -race ./...`, `go vet ./...`; all clean before Proxify
   Phase 9.
