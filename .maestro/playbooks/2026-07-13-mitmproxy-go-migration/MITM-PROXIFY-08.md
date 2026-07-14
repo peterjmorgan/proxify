@@ -80,7 +80,7 @@ no `time.Sleep` as the sole synchronization.
 
   Verified: `go test -race .` and `go vet ./...` clean.
 
-- [ ] **P13 — DNS policy, route rotation, TLS modes end-to-end (depends on P10, P6, P7).**
+- [x] **P13 — DNS policy, route rotation, TLS modes end-to-end (depends on P10, P6, P7).**
   Through the candidate: DNS mapping `mapped.test → 127.0.0.1` reaches a local origin without
   public DNS; deny `127.0.0.0/8` rejects before the origin while a matching allow permits; four
   requests with `rotateEvery=2` to two HTTP proxies then two SOCKS5 proxies assert A,A,B,B
@@ -89,6 +89,34 @@ no `time.Sleep` as the sole synchronization.
   fingerprint requests under `-race` with no shared conversion-map/body race. Expected values:
   proxy ID headers `[A,A,B,B]`; denied-origin hit counter 0; `mapped.test` hit counter 1. Do Not
   Modify: candidate fork APIs, CLI flags, TLS profile registry. Full detail: plan.md §Step P13.
+
+  **Done (2026-07-13):** Added `proxy_dnsroute_test.go` with five E2E tests over the candidate
+  serving core (`Proxy.Run`), all binding `127.0.0.1` with ephemeral ports and no public network:
+  - `TestDNSMappingReachesLocalOriginEndToEnd` — `ListenDNSAddr` + `DNSMapping=mapped.test:127.0.0.1`
+    starts Proxify's tinydns; a client GET to `http://mapped.test:<port>/` reaches a local origin
+    exactly once (hit counter 1, Host carries `mapped.test`). The reserved `.test` TLD cannot resolve
+    publicly, so the hit can only have come through the mapping. New helpers `freeUDPAddr` (ephemeral
+    UDP port in `:port` form) and `waitForDNSMapping` (polls the resolver directly so the counted
+    request is sent only once tinydns is live — deterministic, no startup race).
+  - `TestDenyAllowPolicyEndToEnd` — deny `127.0.0.0/8` rejects before the origin (hit counter 0);
+    the matching allow permits it (hit counter 1, 200). The allow subtest is the differential that
+    proves the deny result isn't a false pass.
+  - `TestUpstreamRouteRotationEndToEnd` — four sequential requests at `rotateEvery=2` over two HTTP
+    upstreams, then two SOCKS5 upstreams; cumulative per-route counts after each request
+    (`[1,0],[2,0],[2,1],[2,2]`) establish the exact `A,A,B,B` order independently per listener
+    (equivalent to the spec's per-request proxy-ID sequence; SOCKS tunnels are opaque so a response
+    header can't carry the ID — cumulative counts assert order without touching the fork fixtures).
+  - `TestTLSModesEndToEnd` — standard transport and named profile `chrome_120` to an HTTPS (H2)
+    origin: each asserts origin-saw-valid-request (200 + echoed `X-Origin-Proto`), `Response.Request`
+    linkage (survives the fhttp↔net/http conversion in fingerprint mode), and non-empty negotiated
+    TLS + HTTP protocol on the client↔MITM leaf.
+  - `TestFingerprintConcurrentRequestsEndToEnd` — 50 concurrent `chrome_120` requests through the
+    serving core, all 200, no shared conversion-map/body race under `-race`.
+
+  **No production changes** (allowed only for observed regressions; none observed). DNS mapping,
+  allow/deny, route rotation, and both TLS modes all flow correctly through `Proxy.Run` as built.
+
+  Verified: `go test -race .` (full root package, 8.1s) and `go vet ./...` clean.
 
 - [ ] **P14 — SOCKS listener and WebSocket behavior (depends on P10 and fork F7).** Through the
   HTTP proxy and the SOCKS5 listener, test HTTP and HTTPS interception callbacks, request
