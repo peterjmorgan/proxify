@@ -6,12 +6,13 @@ numbers there are a pre-work snapshot and drift after P2–P4 edit `proxy.go`, s
 symbol name. Martian still owns `Run` in this phase. All new transports must be concurrent-safe
 and preserve fastdialer policy. Every network test binds `127.0.0.1:0`.
 
-- [ ] **P4 — Extract the protocol-neutral unified interceptor (depends on P2).** New
+- [x] **P4 — Extract the protocol-neutral unified interceptor (depends on P2).** New
   `interceptor.go` defines private `type delegatedRoundTripper func(*http.Request) (*http.Response, error)`
   and `func (p *Proxy) interceptHTTP(ctx context.Context, flow *FlowContext, req *http.Request, next delegatedRoundTripper) (*http.Response, error)`.
   - Exact order: proxy-local short-circuit → request policy/callback → `next` → ensure non-nil body and `resp.Request` = effective req → response policy/callback → return. Extract `modifyRequest(req,flow)` and `modifyResponse(resp,flow)` preserving DSL, match/replace, remove-br, logging, redirects, and callback short-circuit. Replace `hijackNServe` with `serveProxyLocal(req) *http.Response` using an `httptest` recorder for `proxify`, `proxify:80`, `proxify:443`, and the bound `listenAddr`. Stream bodies unless MatchReplace/logger config explicitly buffers — do NOT add unconditional `io.ReadAll`. Keep Martian `ModifyRequest`/`ModifyResponse` thin and operational until P17.
   - Do Not Modify: listener serving, upstream transport construction, logger format.
   - Success: ordered markers request-callback → transport → response-callback; synthetic proxify `/cacert` never invokes transport and `response.Request` is the effective req; nil Request/body is repaired; match-replace mutates `old`→`new` preserving linkage; current Martian E2E still passes. Full detail: plan.md §Step P4.
+  - **Done (2026-07-13):** Added `interceptor.go` with `delegatedRoundTripper`, `interceptHTTP` (fixed 6-step order), extracted `modifyRequest`/`modifyResponse` (protocol-neutral; UserData now stored on `FlowContext` key `user-data`), `serveProxyLocal` (httptest recorder), and `isProxyLocal`. `ModifyRequest`/`ModifyResponse` in `proxy.go` are now thin Martian bridges delegating to the shared policy; `hijackNServe` is a thin hijack-and-write shim over `serveProxyLocal`. No unconditional `io.ReadAll` added — bodies stream; only existing MatchReplace/logger buffering runs. New `interceptor_test.go` covers all four success criteria (ordering, proxy-local short-circuit + `resp.Request` linkage, nil body/Request repair, match-replace old→new + linkage). `go test ./...`, `go test -race ./...`, `go vet ./...` all clean; existing Martian characterization E2E still passes.
 
 - [ ] **P5 — Correct the direct standard transport (depends on P1).** Move transport code to
   `transport.go`. Add `newStandardTransport(dialer *fastdialer.Dialer) *http.Transport` with the

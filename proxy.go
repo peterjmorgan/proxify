@@ -9,7 +9,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
 	"os"
@@ -38,7 +37,6 @@ import (
 	errorutil "github.com/projectdiscovery/utils/errors"
 	readerUtil "github.com/projectdiscovery/utils/reader"
 	sliceutil "github.com/projectdiscovery/utils/slice"
-	stringsutil "github.com/projectdiscovery/utils/strings"
 	"github.com/things-go/go-socks5"
 	"golang.org/x/net/proxy"
 )
@@ -208,7 +206,12 @@ func NewProxy(options *Options) (*Proxy, error) {
 // *FlowContext is stored by ModifyRequest and retrieved by ModifyResponse.
 const flowContextKey = "proxify-flow-context"
 
-// ModifyRequest
+// ModifyRequest is the Martian request-modifier bridge. It stays deliberately
+// thin: it establishes the engine-neutral *FlowContext, handles the
+// proxy-local short circuit, and delegates all request-side policy to the
+// shared modifyRequest. The unified interceptHTTP path (P9+) shares the same
+// policy helper. Martian owns the round trip in this phase, so the bridge does
+// not call interceptHTTP directly.
 func (p *Proxy) ModifyRequest(req *http.Request) error {
 	// // Set Content-Length to zero to allow automatic calculation
 	req.ContentLength = -1
@@ -225,46 +228,13 @@ func (p *Proxy) ModifyRequest(req *http.Request) error {
 	flow := newFlowContext(ctx.ID(), ctx.ID(), req.TLS != nil)
 	ctx.Set(flowContextKey, flow)
 
-	// setup passthrought and hijack here
-	userData := types.UserData{
-		ID:   flow.ID(),
-		Host: req.Host,
-	}
-
-	if stringsutil.EqualFoldAny(req.Host, "proxify", "proxify:443", "proxify:80", p.listenAddr) {
-		// hijack if this is true
+	// Proxy-local hosts are served synthetically; martian delivers the response
+	// by hijacking the client connection (see hijackNServe).
+	if p.isProxyLocal(req.Host) {
 		return p.hijackNServe(req, ctx)
 	}
 
-	// If callbacks are given use them (for library use cases)
-	if p.options.OnRequestCallback != nil {
-		return p.options.OnRequestCallback(req, flow)
-	}
-
-	boolSlice := []bool{}
-	for _, expr := range p.options.RequestDSL {
-		m, _ := util.HTTPRequestToMap(req)
-		v, err := dsl.EvalExpr(expr, m)
-		if err != nil {
-			gologger.Warning().Msgf("Could not evaluate request dsl: %s\n", err)
-		}
-		boolSlice = append(boolSlice, err == nil && v.(bool))
-	}
-	// evaluate bool array to get match status
-	if len(boolSlice) > 0 {
-		tmp := util.EvalBoolSlice(boolSlice)
-		userData.Match = &tmp
-	}
-
-	ctx.Set("user-data", userData)
-
-	// perform match and replace
-	if len(p.options.RequestMatchReplaceDSL) != 0 {
-		_ = p.MatchReplaceRequest(req)
-	}
-	p.removeBrEncoding(req)
-	_ = p.logger.LogRequest(req, userData)
-	return nil
+	return p.modifyRequest(req, flow)
 }
 
 func (*Proxy) removeBrEncoding(req *http.Request) {
@@ -274,7 +244,9 @@ func (*Proxy) removeBrEncoding(req *http.Request) {
 
 }
 
-// ModifyResponse
+// ModifyResponse is the Martian response-modifier bridge. Like ModifyRequest
+// it is thin: it recovers the *FlowContext established for this flow and
+// delegates all response-side policy to the shared modifyResponse.
 func (p *Proxy) ModifyResponse(resp *http.Response) error {
 	ctx := martian.NewContext(resp.Request)
 	// Retrieve the same *FlowContext created for this flow in ModifyRequest.
@@ -282,68 +254,7 @@ func (p *Proxy) ModifyResponse(resp *http.Response) error {
 	if w, ok := ctx.Get(flowContextKey); ok {
 		flow, _ = w.(*FlowContext)
 	}
-	var userData *types.UserData
-	if w, ok := ctx.Get("user-data"); ok {
-		if data, ok2 := w.(types.UserData); ok2 {
-			userData = &data
-		}
-	}
-	if userData == nil {
-		gologger.Warning().Msgf("something went wrong got response without userData")
-		// pass empty struct to avoid panic
-		userData = &types.UserData{}
-	}
-	userData.HasResponse = true
-
-	// if content-length is zero and remove header
-	if resp.ContentLength == 0 {
-		resp.Header.Del("Content-Length")
-	}
-
-	// If callbacks are given use them (for library use cases)
-	if p.options.OnResponseCallback != nil {
-		if flow == nil {
-			// No request-side flow context (e.g. response without a tracked
-			// request); provide a fresh one so callbacks never receive nil.
-			flow = newFlowContext("", "", resp.TLS != nil)
-		}
-		return p.options.OnResponseCallback(resp, flow)
-	}
-
-	boolSlice := []bool{}
-	for _, expr := range p.options.ResponseDSL {
-		m, _ := util.HTTPResponseToMap(resp)
-		v, err := dsl.EvalExpr(expr, m)
-		if err != nil {
-			gologger.Warning().Msgf("Could not evaluate response dsl: %s\n", err)
-		}
-		boolSlice = append(boolSlice, err == nil && v.(bool))
-	}
-	if len(boolSlice) > 0 {
-		tmp := util.EvalBoolSlice(boolSlice)
-		// finalize
-		if userData.Match != nil {
-			tmp = *userData.Match && tmp
-		}
-		userData.Match = &tmp
-	}
-	// perform match and replace
-	if len(p.options.ResponseMatchReplaceDSL) != 0 {
-		_ = p.MatchReplaceResponse(resp)
-	}
-	_ = p.logger.LogResponse(resp, *userData)
-	if resp.StatusCode == 301 || resp.StatusCode == 302 {
-		// set connection close header
-		// close connection if redirected to different host
-		if loc, err := resp.Location(); err == nil {
-			if loc.Host == resp.Request.Host {
-				// if same host redirect do not close connection
-				return nil
-			}
-		}
-		resp.Close = true
-	}
-	return nil
+	return p.modifyResponse(resp, flow)
 }
 
 // MatchReplaceRequest strings or regex
@@ -702,6 +613,10 @@ func (p *Proxy) httpTunnelDialer(ctx context.Context, network, addr string) (net
 	return p.socks5tunnel.MakeTunnel(nil, nil, p.bufioPool, addr)
 }
 
+// hijackNServe is the Martian-specific delivery shim for proxy-local hosts. It
+// hijacks the client connection and writes the response built by the shared
+// serveProxyLocal. The candidate path (P9+) returns serveProxyLocal's response
+// directly and needs no hijack.
 func (p *Proxy) hijackNServe(req *http.Request, ctx *martian.Context) error {
 	conn, brw, err := ctx.Session().Hijack()
 	if err != nil {
@@ -710,10 +625,7 @@ func (p *Proxy) hijackNServe(req *http.Request, ctx *martian.Context) error {
 	defer func() {
 		_ = conn.Close()
 	}()
-	rec := httptest.NewRecorder()
-	p.proxifyMux.ServeHTTP(rec, req)
-	resp := rec.Result()
-	resp.Close = true
+	resp := p.serveProxyLocal(req)
 	if err := resp.Write(brw); err != nil {
 		gologger.Warning().Msgf("failed to write response: %v", err)
 	}
